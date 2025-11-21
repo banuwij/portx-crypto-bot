@@ -7,6 +7,9 @@ const Jimp = require('jimp');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
 
+// mode bot: 'live' = kirim ke channel, 'test' = hanya preview di DM
+let BOT_MODE = 'live';
+
 // key: signalId, value: signal object
 const activeSignals = new Map();
 // histori sinyal yang sudah selesai (TP / SL / EXPIRED)
@@ -249,7 +252,169 @@ bot.command('status', async (ctx) => {
   }
 });
 
-// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID (Markdown premium, tanpa risk/vol/duration text) ---
+// --- MODE LIVE / TEST (hanya lewat DM) ---
+bot.command('mode_live', async (ctx) => {
+  if (ctx.chat.type !== 'private') {
+    await ctx.reply('Ganti mode hanya bisa dari DM ke bot.');
+    return;
+  }
+  BOT_MODE = 'live';
+  await ctx.reply('Mode bot di-set ke: LIVE ✅ (sinyal /send akan dikirim ke channel).');
+});
+
+bot.command('mode_test', async (ctx) => {
+  if (ctx.chat.type !== 'private') {
+    await ctx.reply('Ganti mode hanya bisa dari DM ke bot.');
+    return;
+  }
+  BOT_MODE = 'test';
+  await ctx.reply('Mode bot di-set ke: TEST 🧪 (sinyal /send hanya preview di DM, tidak dikirim ke channel).');
+});
+
+bot.command('mode_status', async (ctx) => {
+  await ctx.reply(`Mode bot saat ini: ${BOT_MODE.toUpperCase()}`);
+});
+
+// --- Mini FAQ / edukasi ---
+bot.command('explain_entry', async (ctx) => {
+  await ctx.reply(
+    [
+      '📚 *ENTRY ZONE — Penjelasan Singkat*',
+      '',
+      'Entry zone adalah area harga di mana setup dianggap valid untuk mulai masuk posisi.',
+      '• Kalau harga belum masuk zona → kita tunggu.',
+      '• Kalau harga sudah lewat jauh dari zona → setup dianggap terlambat / invalid.',
+      '',
+      'Tujuan utama: *hindari FOMO*, disiplin masuk hanya di area yang sudah direncanakan.',
+    ].join('\n'),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+bot.command('explain_sl', async (ctx) => {
+  await ctx.reply(
+    [
+      '📚 *STOP LOSS — Kenapa Wajib?*',
+      '',
+      'Stop loss adalah level harga di mana kita menerima bahwa ide trade salah dan keluar dengan kerugian terkontrol.',
+      'Tanpa SL, satu posisi bisa menghapus profit banyak posisi sebelumnya.',
+      '',
+      'Prinsip PortX:',
+      '• SL selalu dipasang sejak awal.',
+      '• Tidak digeser menjauh hanya karena tidak rela cut loss.',
+      '• Loss kecil sekarang lebih sehat daripada margin habis besok.',
+    ].join('\n'),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+bot.command('explain_trailing', async (ctx) => {
+  await ctx.reply(
+    [
+      '📚 *TRAILING STOP — Versi Singkat*',
+      '',
+      'Trailing stop adalah SL yang ikut naik (untuk LONG) atau turun (untuk SHORT) ketika harga sudah bergerak cukup jauh ke arah kita.',
+      '',
+      'Tujuannya:',
+      '• Mengunci profit (lock-in) tanpa harus nebak puncak/bottom.',
+      '• Kalau harga berbalik tajam, posisi keluar dengan profit yang sudah terkunci.',
+      '',
+      'Di PortX Crypto Lab, trailing aktif otomatis setelah harga melewati ambang tertentu dari entry.',
+    ].join('\n'),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+// --- Performance summary ---
+bot.command('performance', async (ctx) => {
+  if (history.length === 0) {
+    await ctx.reply('Belum ada histori sinyal yang selesai untuk dianalisis.');
+    return;
+  }
+
+  const chatId = ctx.chat.id;
+  const items = history.filter((h) => h.chatId === chatId);
+  if (items.length === 0) {
+    await ctx.reply('Belum ada histori sinyal selesai untuk chat ini.');
+    return;
+  }
+
+  const total = items.length;
+  const tpCount = items.filter((x) => x.outcome === 'TP').length;
+  const slCount = items.filter((x) => x.outcome === 'SL').length;
+  const expCount = items.filter((x) => x.outcome === 'EXPIRED').length;
+  const winrate = total > 0 ? ((tpCount / total) * 100).toFixed(2) : '0.00';
+
+  const lines = [];
+  lines.push('📊 PortX Crypto Lab — Performance Summary');
+  lines.push('');
+  lines.push(`Total sinyal selesai: ${total}`);
+  lines.push(`TP: ${tpCount}`);
+  lines.push(`SL: ${slCount}`);
+  lines.push(`Expired: ${expCount}`);
+  lines.push(`Winrate (TP/total): ${winrate}%`);
+  lines.push('');
+  lines.push('Catatan: ini berdasarkan sinyal yang sudah selesai (TP / SL / EXPIRED) di chat ini.');
+
+  await ctx.reply(lines.join('\n'));
+});
+
+// --- Export CSV history ---
+bot.command('export', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const items = history.filter((h) => h.chatId === chatId);
+
+  if (items.length === 0) {
+    await ctx.reply('Belum ada histori sinyal selesai untuk diexport.');
+    return;
+  }
+
+  const header = [
+    'pair',
+    'side',
+    'outcome',
+    'entryLow',
+    'entryHigh',
+    'stoploss',
+    'takeProfit',
+    'createdAt',
+    'closedAt',
+    'priceAtClose',
+  ].join(',');
+
+  const lines = [header];
+
+  for (const h of items) {
+    const row = [
+      h.pair,
+      h.side,
+      h.outcome,
+      h.entryLow,
+      h.entryHigh,
+      h.stoploss,
+      h.takeProfit ?? '',
+      new Date(h.createdAt).toISOString(),
+      new Date(h.closedAt).toISOString(),
+      h.priceAtClose ?? '',
+    ]
+      .map((v) => `${v}`)
+      .join(',');
+    lines.push(row);
+  }
+
+  const csvContent = lines.join('\n');
+  const buffer = Buffer.from(csvContent, 'utf8');
+
+  await ctx.replyWithDocument(
+    {
+      source: buffer,
+      filename: 'portx_crypto_lab_history.csv',
+    },
+    { caption: 'Export histori sinyal PortX Crypto Lab (CSV).' },
+  );
+});
+
+// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID (Markdown premium, dengan NOTE & Chart) ---
 bot.command('send', async (ctx) => {
   try {
     if (!TARGET_GROUP_ID) {
@@ -279,6 +444,7 @@ bot.command('send', async (ctx) => {
           'STOPLOSS: 89550',
           'TAKE_PROFIT: 92300',
           'MAX_RUNTIME_MIN: 600',
+          'NOTE: catatan singkat (opsional)',
           'RISK: LOW/MEDIUM/HIGH (opsional, hanya masuk blok teknis)',
           'VOL: LOW/MEDIUM/HIGH (opsional, hanya masuk blok teknis)',
           'DURATION: SCALP/INTRADAY/SWING (opsional, hanya masuk blok teknis)',
@@ -306,6 +472,7 @@ bot.command('send', async (ctx) => {
     const sl = data.STOPLOSS || '-';
     const tp = data.TAKE_PROFIT || 'secukupnya (open)';
     const maxRuntime = data.MAX_RUNTIME_MIN || '720';
+    const note = data.NOTE || null;
 
     // optional chart
     const chartUrl = data.CHART || data.CHART_URL || null;
@@ -337,7 +504,8 @@ bot.command('send', async (ctx) => {
     if (data.MAX_RUNTIME_MIN) {
       engineLines.push(`MAX_RUNTIME_MIN: ${data.MAX_RUNTIME_MIN}`);
     }
-    // simpan info tambahan di blok teknis saja
+    if (data.NOTE) engineLines.push(`NOTE: ${data.NOTE}`);
+    // info tambahan disimpan di blok teknis saja
     if (data.RISK) engineLines.push(`RISK: ${data.RISK}`);
     const volRaw = (data.VOL || data.VOLATILITY || '');
     if (volRaw) engineLines.push(`VOL: ${volRaw}`);
@@ -358,6 +526,10 @@ bot.command('send', async (ctx) => {
     prettyLines.push(`*SL*    : \`${sl}\``);
     prettyLines.push(`*TP*    : \`${tp}\``);
     prettyLines.push(`🕒 *Masa berlaku* : \`${maxRuntime} menit\``);
+    if (note) {
+      prettyLines.push('');
+      prettyLines.push(`📝 *Catatan* : ${note}`);
+    }
     if (chartLine) {
       prettyLines.push('');
       prettyLines.push(chartLine);
@@ -369,11 +541,22 @@ bot.command('send', async (ctx) => {
 
     const fullMessage = prettyLines.join('\n');
 
-    await bot.telegram.sendMessage(TARGET_GROUP_ID, fullMessage, {
-      parse_mode: 'Markdown',
-    });
-
-    await ctx.reply('Sinyal sudah dikirim ke channel/group PortX.');
+    if (BOT_MODE === 'test') {
+      // hanya preview ke DM, tidak kirim ke channel
+      await ctx.reply(
+        [
+          '🧪 *TEST MODE* — sinyal *TIDAK* dikirim ke channel.',
+          '',
+          fullMessage,
+        ].join('\n'),
+        { parse_mode: 'Markdown' },
+      );
+    } else {
+      await bot.telegram.sendMessage(TARGET_GROUP_ID, fullMessage, {
+        parse_mode: 'Markdown',
+      });
+      await ctx.reply('Sinyal sudah dikirim ke channel/group PortX.');
+    }
   } catch (err) {
     console.error('/send error:', err.message);
     await ctx.reply('Terjadi error saat memproses /send.');
@@ -427,7 +610,18 @@ bot.on('text', async (ctx) => {
       highestPrice: null, // untuk LONG
       lowestPrice: null, // untuk SHORT
       closed: false,
+      anchorMessageId: null,
     };
+
+    // 🧵 buat anchor thread untuk sinyal ini
+    const anchor = await ctx.reply(
+      [
+        `🧵 Thread sinyal — ${signal.pair} ${signal.side}`,
+        'Diskusi & semua update (TP/SL/trailing/expired) akan muncul di bawah pesan ini.',
+      ].join('\n'),
+      { reply_to_message_id: messageId },
+    );
+    signal.anchorMessageId = anchor.message_id;
 
     activeSignals.set(signalId, signal);
 
@@ -509,7 +703,11 @@ bot.on('photo', async (ctx) => {
 async function fetchPrice(symbol) {
   const url = `https://contract.mexc.com/api/v1/contract/index_price/${symbol}`;
   const res = await axios.get(url);
-  if (!res.data || !res.data.data || typeof res.data.data.indexPrice === 'undefined') {
+  if (
+    !res.data ||
+    !res.data.data ||
+    typeof res.data.data.indexPrice === 'undefined'
+  ) {
     throw new Error(`Invalid index price response for ${symbol}`);
   }
   const price = parseFloat(res.data.data.indexPrice);
@@ -536,8 +734,7 @@ function handleTrailing(signal, price) {
         signal.trailingActive = true;
       }
 
-      const targetSL =
-        signal.highestPrice * (1 - signal.trailGapPct);
+      const targetSL = signal.highestPrice * (1 - signal.trailGapPct);
 
       if (targetSL > signal.stoploss) {
         signal.stoploss = targetSL;
@@ -563,8 +760,7 @@ function handleTrailing(signal, price) {
         signal.trailingActive = true;
       }
 
-      const targetSL =
-        signal.lowestPrice * (1 + signal.trailGapPct);
+      const targetSL = signal.lowestPrice * (1 + signal.trailGapPct);
 
       if (targetSL < signal.stoploss) {
         signal.stoploss = targetSL;
@@ -591,6 +787,8 @@ async function checkSignals() {
         continue;
       }
 
+      const replyTarget = signal.anchorMessageId || signal.messageId;
+
       // Expire jika belum trigger dalam MAX_RUNTIME_MIN
       const ageMin = (Date.now() - signal.createdAt) / 60000;
       if (!signal.triggered && ageMin > signal.maxRuntimeMin) {
@@ -601,7 +799,7 @@ async function checkSignals() {
             `Belum tersentuh entry dalam ${signal.maxRuntimeMin} menit.`,
             'PortX Crypto Lab — discipline first.',
           ].join('\n'),
-          { reply_to_message_id: signal.messageId },
+          { reply_to_message_id: replyTarget },
         );
         recordHistory(signal, 'EXPIRED', null);
 
@@ -621,7 +819,11 @@ async function checkSignals() {
 
       // --- SIDE LONG ---
       if (signal.side === 'LONG') {
-        if (!signal.triggered && price >= signal.entryLow && price <= signal.entryHigh) {
+        if (
+          !signal.triggered &&
+          price >= signal.entryLow &&
+          price <= signal.entryHigh
+        ) {
           signal.triggered = true;
           signal.triggeredPrice = price;
           signal.triggeredAt = Date.now();
@@ -637,16 +839,13 @@ async function checkSignals() {
               '',
               'PortX Crypto Lab — Execute with discipline.',
             ].join('\n'),
-            { reply_to_message_id: signal.messageId },
+            { reply_to_message_id: replyTarget },
           );
         }
 
         if (signal.triggered) {
           // TP biasa
-          if (
-            signal.takeProfit != null &&
-            price >= signal.takeProfit
-          ) {
+          if (signal.takeProfit != null && price >= signal.takeProfit) {
             signal.closed = true;
             recordHistory(signal, 'TP', price);
             await bot.telegram.sendMessage(
@@ -659,7 +858,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — TP tercapai.',
               ].join('\n'),
-              { reply_to_message_id: signal.messageId },
+              { reply_to_message_id: replyTarget },
             );
 
             try {
@@ -685,7 +884,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
-              { reply_to_message_id: signal.messageId },
+              { reply_to_message_id: replyTarget },
             );
           }
 
@@ -703,7 +902,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Loss kecil, nafas panjang.',
               ].join('\n'),
-              { reply_to_message_id: signal.messageId },
+              { reply_to_message_id: replyTarget },
             );
 
             try {
@@ -720,7 +919,11 @@ async function checkSignals() {
 
       // --- SIDE SHORT ---
       if (signal.side === 'SHORT') {
-        if (!signal.triggered && price >= signal.entryLow && price <= signal.entryHigh) {
+        if (
+          !signal.triggered &&
+          price >= signal.entryLow &&
+          price <= signal.entryHigh
+        ) {
           signal.triggered = true;
           signal.triggeredPrice = price;
           signal.triggeredAt = Date.now();
@@ -736,16 +939,13 @@ async function checkSignals() {
               '',
               'PortX Crypto Lab — Execute with discipline.',
             ].join('\n'),
-            { reply_to_message_id: signal.messageId },
+            { reply_to_message_id: replyTarget },
           );
         }
 
         if (signal.triggered) {
           // TP biasa (short: harga turun)
-          if (
-            signal.takeProfit != null &&
-            price <= signal.takeProfit
-          ) {
+          if (signal.takeProfit != null && price <= signal.takeProfit) {
             signal.closed = true;
             recordHistory(signal, 'TP', price);
             await bot.telegram.sendMessage(
@@ -758,7 +958,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — TP tercapai.',
               ].join('\n'),
-              { reply_to_message_id: signal.messageId },
+              { reply_to_message_id: replyTarget },
             );
 
             try {
@@ -784,7 +984,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
-              { reply_to_message_id: signal.messageId },
+              { reply_to_message_id: replyTarget },
             );
           }
 
@@ -802,7 +1002,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Loss kecil, nafas panjang.',
               ].join('\n'),
-              { reply_to_message_id: signal.messageId },
+              { reply_to_message_id: replyTarget },
             );
 
             try {
@@ -943,7 +1143,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send Markdown...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send premium + mode live/test + thread anchor + FAQ + performance + export CSV...',
   );
 });
 
