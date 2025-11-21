@@ -48,9 +48,15 @@ function parseSignalBlock(text) {
   }
 
   const stoploss = parseFloat(data.STOPLOSS);
-  const partialTpPct = data.PARTIAL_TP_PCT
-    ? parseFloat(data.PARTIAL_TP_PCT)
-    : 0.03; // default 3%
+  const takeProfit = data.TAKE_PROFIT ? parseFloat(data.TAKE_PROFIT) : null;
+
+  const trailStartPct = data.TRAIL_START_PCT
+    ? parseFloat(data.TRAIL_START_PCT)
+    : 0.03; // default mulai trailing di +3%
+  const trailGapPct = data.TRAIL_GAP_PCT
+    ? parseFloat(data.TRAIL_GAP_PCT)
+    : 0.02; // default jarak trailing 2%
+
   const maxRuntimeMin = data.MAX_RUNTIME_MIN
     ? parseInt(data.MAX_RUNTIME_MIN, 10)
     : 720; // default 12 jam
@@ -61,7 +67,9 @@ function parseSignalBlock(text) {
     entryLow,
     entryHigh,
     stoploss,
-    partialTpPct,
+    takeProfit,
+    trailStartPct,
+    trailGapPct,
     maxRuntimeMin,
   };
 }
@@ -75,14 +83,17 @@ function makeSignalId(chatId, messageId, pair) {
 function formatSignalStatus(signal, index) {
   const ageMin = ((Date.now() - signal.createdAt) / 60000).toFixed(1);
   const triggeredText = signal.triggered ? 'YA' : 'BELUM';
-  const partialText = signal.partialNotified ? 'YA' : 'BELUM';
+  const trailText = signal.trailingActive ? 'AKTIF' : 'BELUM';
+  const tpText =
+    signal.takeProfit != null ? signal.takeProfit : '—';
 
   return [
     `${index}) ${signal.pair} — ${signal.side}`,
     `   Entry : ${signal.entryLow} - ${signal.entryHigh}`,
     `   SL    : ${signal.stoploss}`,
+    `   TP    : ${tpText}`,
     `   Triggered  : ${triggeredText}`,
-    `   Partial TP : ${partialText}`,
+    `   Trailing   : ${trailText}`,
     `   Umur       : ${ageMin} menit`,
   ].join('\n');
 }
@@ -144,11 +155,15 @@ bot.on('text', async (ctx) => {
       entryHigh: parsed.entryHigh,
       entryAvg,
       stoploss: parsed.stoploss,
-      partialTpPct: parsed.partialTpPct,
+      takeProfit: parsed.takeProfit,
+      trailStartPct: parsed.trailStartPct,
+      trailGapPct: parsed.trailGapPct,
       maxRuntimeMin: parsed.maxRuntimeMin,
       createdAt: now,
       triggered: false,
-      partialNotified: false,
+      trailingActive: false,
+      highestPrice: null, // untuk LONG
+      lowestPrice: null, // untuk SHORT
       closed: false,
     };
 
@@ -161,7 +176,9 @@ bot.on('text', async (ctx) => {
         `SIDE: ${signal.side}`,
         `ENTRY: ${signal.entryLow} - ${signal.entryHigh}`,
         `SL: ${signal.stoploss}`,
-        `Partial TP: ${(signal.partialTpPct * 100).toFixed(1)}%`,
+        `TP: ${signal.takeProfit != null ? signal.takeProfit : '—'}`,
+        `Trailing start: ${(signal.trailStartPct * 100).toFixed(1)}%`,
+        `Trailing gap  : ${(signal.trailGapPct * 100).toFixed(1)}%`,
         `Lifetime: ${signal.maxRuntimeMin} menit`,
       ].join('\n'),
       { reply_to_message_id: messageId },
@@ -181,6 +198,74 @@ async function fetchPrice(symbol) {
     throw new Error(`Invalid price from MEXC for ${symbol}`);
   }
   return price;
+}
+
+// --- Logic trailing stop update ---
+function handleTrailing(signal, price) {
+  // hanya bekerja setelah entry triggered
+  if (!signal.triggered) return;
+
+  if (signal.side === 'LONG') {
+    // update highestPrice
+    if (signal.highestPrice == null || price > signal.highestPrice) {
+      signal.highestPrice = price;
+    }
+
+    const gainFromEntry =
+      (signal.highestPrice - signal.entryAvg) / signal.entryAvg;
+
+    if (gainFromEntry >= signal.trailStartPct) {
+      if (!signal.trailingActive) {
+        signal.trailingActive = true;
+      }
+
+      const targetSL =
+        signal.highestPrice * (1 - signal.trailGapPct);
+
+      if (targetSL > signal.stoploss) {
+        // geser SL naik
+        signal.stoploss = targetSL;
+        return {
+          updated: true,
+          newSL: targetSL,
+          gainFromEntry:
+            (signal.highestPrice - signal.entryAvg) / signal.entryAvg,
+        };
+      }
+    }
+  }
+
+  if (signal.side === 'SHORT') {
+    // update lowestPrice
+    if (signal.lowestPrice == null || price < signal.lowestPrice) {
+      signal.lowestPrice = price;
+    }
+
+    const gainFromEntry =
+      (signal.entryAvg - signal.lowestPrice) / signal.entryAvg;
+
+    if (gainFromEntry >= signal.trailStartPct) {
+      if (!signal.trailingActive) {
+        signal.trailingActive = true;
+      }
+
+      const targetSL =
+        signal.lowestPrice * (1 + signal.trailGapPct);
+
+      if (targetSL < signal.stoploss) {
+        // geser SL turun (lebih ketat) untuk SHORT
+        signal.stoploss = targetSL;
+        return {
+          updated: true,
+          newSL: targetSL,
+          gainFromEntry:
+            (signal.entryAvg - signal.lowestPrice) / signal.entryAvg,
+        };
+      }
+    }
+  }
+
+  return { updated: false };
 }
 
 // --- Logic cek sinyal ---
@@ -219,6 +304,7 @@ async function checkSignals() {
           signal.triggered = true;
           signal.triggeredPrice = price;
           signal.triggeredAt = Date.now();
+          signal.highestPrice = price;
 
           await bot.telegram.sendMessage(
             signal.chatId,
@@ -233,39 +319,62 @@ async function checkSignals() {
           );
         }
 
-        // Partial TP
-        if (signal.triggered && !signal.partialNotified) {
-          const gain = (price - signal.entryAvg) / signal.entryAvg;
-          if (gain >= signal.partialTpPct) {
-            signal.partialNotified = true;
+        // Kalau sudah triggered → cek TP & trailing & SL
+        if (signal.triggered) {
+          // TP biasa
+          if (
+            signal.takeProfit != null &&
+            price >= signal.takeProfit
+          ) {
+            signal.closed = true;
             await bot.telegram.sendMessage(
               signal.chatId,
               [
-                `🟡 PARTIAL TP HIT — ${signal.pair}`,
-                `Floating profit: ${(gain * 100).toFixed(2)}%`,
-                'Saran: partial TP & protect sisa posisi.',
+                `🏁 TAKE PROFIT HIT — ${signal.pair}`,
+                'Side: LONG',
+                `TP: ${signal.takeProfit}`,
+                `Harga saat ini: ${price}`,
+                '',
+                'PortX Crypto Lab — TP tercapai.',
+              ].join('\n'),
+            );
+            activeSignals.delete(id);
+            continue;
+          }
+
+          // Trailing SL logic
+          const trailResult = handleTrailing(signal, price);
+          if (trailResult.updated) {
+            await bot.telegram.sendMessage(
+              signal.chatId,
+              [
+                `🔧 TRAILING SL UPDATED — ${signal.pair}`,
+                'Side: LONG',
+                `SL baru: ${trailResult.newSL.toFixed(4)}`,
+                `Max gain tercatat: ${(trailResult.gainFromEntry * 100).toFixed(2)}%`,
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
             );
           }
-        }
 
-        // Stoploss
-        if (signal.triggered && price <= signal.stoploss) {
-          signal.closed = true;
-          await bot.telegram.sendMessage(
-            signal.chatId,
-            [
-              `🔴 STOPLOSS HIT — ${signal.pair}`,
-              'Side: LONG',
-              `SL: ${signal.stoploss}`,
-              `Harga saat ini: ${price}`,
-              '',
-              'PortX Crypto Lab — Loss kecil, nafas panjang.',
-            ].join('\n'),
-          );
-          activeSignals.delete(id);
+          // Stoploss (bisa SL awal atau SL hasil trailing)
+          if (price <= signal.stoploss) {
+            signal.closed = true;
+            await bot.telegram.sendMessage(
+              signal.chatId,
+              [
+                `🔴 STOPLOSS HIT — ${signal.pair}`,
+                'Side: LONG',
+                `SL: ${signal.stoploss}`,
+                `Harga saat ini: ${price}`,
+                '',
+                'PortX Crypto Lab — Loss kecil, nafas panjang.',
+              ].join('\n'),
+            );
+            activeSignals.delete(id);
+            continue;
+          }
         }
       }
 
@@ -276,6 +385,7 @@ async function checkSignals() {
           signal.triggered = true;
           signal.triggeredPrice = price;
           signal.triggeredAt = Date.now();
+          signal.lowestPrice = price;
 
           await bot.telegram.sendMessage(
             signal.chatId,
@@ -290,40 +400,61 @@ async function checkSignals() {
           );
         }
 
-        // Partial TP (short = harga turun)
-        if (signal.triggered && !signal.partialNotified) {
-          const gain = (signal.entryAvg - price) / signal.entryAvg;
-          if (gain >= signal.partialTpPct) {
-            signal.partialNotified = true;
+        if (signal.triggered) {
+          // TP biasa (short: harga turun)
+          if (
+            signal.takeProfit != null &&
+            price <= signal.takeProfit
+          ) {
+            signal.closed = true;
             await bot.telegram.sendMessage(
               signal.chatId,
               [
-                `🟡 PARTIAL TP HIT — ${signal.pair}`,
+                `🏁 TAKE PROFIT HIT — ${signal.pair}`,
                 'Side: SHORT',
-                `Floating profit: ${(gain * 100).toFixed(2)}%`,
-                'Saran: partial TP & protect sisa posisi.',
+                `TP: ${signal.takeProfit}`,
+                `Harga saat ini: ${price}`,
+                '',
+                'PortX Crypto Lab — TP tercapai.',
+              ].join('\n'),
+            );
+            activeSignals.delete(id);
+            continue;
+          }
+
+          // Trailing SL logic
+          const trailResult = handleTrailing(signal, price);
+          if (trailResult.updated) {
+            await bot.telegram.sendMessage(
+              signal.chatId,
+              [
+                `🔧 TRAILING SL UPDATED — ${signal.pair}`,
+                'Side: SHORT',
+                `SL baru: ${trailResult.newSL.toFixed(4)}`,
+                `Max gain tercatat: ${(trailResult.gainFromEntry * 100).toFixed(2)}%`,
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
             );
           }
-        }
 
-        // Stoploss (short: harga naik)
-        if (signal.triggered && price >= signal.stoploss) {
-          signal.closed = true;
-          await bot.telegram.sendMessage(
-            signal.chatId,
-            [
-              `🔴 STOPLOSS HIT — ${signal.pair}`,
-              'Side: SHORT',
-              `SL: ${signal.stoploss}`,
-              `Harga saat ini: ${price}`,
-              '',
-              'PortX Crypto Lab — Loss kecil, nafas panjang.',
-            ].join('\n'),
-          );
-          activeSignals.delete(id);
+          // Stoploss (short: harga naik)
+          if (price >= signal.stoploss) {
+            signal.closed = true;
+            await bot.telegram.sendMessage(
+              signal.chatId,
+              [
+                `🔴 STOPLOSS HIT — ${signal.pair}`,
+                'Side: SHORT',
+                `SL: ${signal.stoploss}`,
+                `Harga saat ini: ${price}`,
+                '',
+                'PortX Crypto Lab — Loss kecil, nafas panjang.',
+              ].join('\n'),
+            );
+            activeSignals.delete(id);
+            continue;
+          }
         }
       }
     } catch (err) {
@@ -337,7 +468,7 @@ setInterval(checkSignals, 5000);
 
 // Start bot
 bot.launch().then(() => {
-  console.log('PortX Crypto Lab bot running with MEXC price feed...');
+  console.log('PortX Crypto Lab bot running with MEXC price feed + TP + trailing SL...');
 });
 
 // Graceful stop
