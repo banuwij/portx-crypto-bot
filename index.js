@@ -249,7 +249,7 @@ bot.command('status', async (ctx) => {
   }
 });
 
-// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID dengan format rapi (Markdown + emoji + risk/vol/horizon/chart)
+// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID (Markdown premium, tanpa risk/vol/duration text) ---
 bot.command('send', async (ctx) => {
   try {
     if (!TARGET_GROUP_ID) {
@@ -279,9 +279,9 @@ bot.command('send', async (ctx) => {
           'STOPLOSS: 89550',
           'TAKE_PROFIT: 92300',
           'MAX_RUNTIME_MIN: 600',
-          'RISK: LOW/MEDIUM/HIGH (opsional)',
-          'VOL: LOW/MEDIUM/HIGH (opsional)',
-          'DURATION: SCALP/INTRADAY/SWING (opsional)',
+          'RISK: LOW/MEDIUM/HIGH (opsional, hanya masuk blok teknis)',
+          'VOL: LOW/MEDIUM/HIGH (opsional, hanya masuk blok teknis)',
+          'DURATION: SCALP/INTRADAY/SWING (opsional, hanya masuk blok teknis)',
           'CHART: https://link-chart (opsional)',
         ].join('\n'),
       );
@@ -307,49 +307,7 @@ bot.command('send', async (ctx) => {
     const tp = data.TAKE_PROFIT || 'secukupnya (open)';
     const maxRuntime = data.MAX_RUNTIME_MIN || '720';
 
-    // 🔥 Risk rating
-    let riskLine = null;
-    if (data.RISK) {
-      const r = data.RISK.toUpperCase();
-      if (r === 'LOW') riskLine = '🔥 *Risk* : Low (konservatif)';
-      else if (r === 'MEDIUM' || r === 'MID')
-        riskLine = '🔥 *Risk* : Medium (seimbang)';
-      else if (r === 'HIGH')
-        riskLine = '🔥 *Risk* : High (agresif)';
-      else riskLine = `🔥 *Risk* : ${data.RISK}`;
-    }
-
-    // 📊 Volatility indicator
-    const volRaw = (data.VOL || data.VOLATILITY || '').toUpperCase();
-    let volLine = null;
-    if (volRaw) {
-      if (volRaw === 'LOW') {
-        volLine = '📊 *Volatility* : Calm (Low)';
-      } else if (volRaw === 'MEDIUM' || volRaw === 'MID') {
-        volLine = '📊 *Volatility* : Normal (Medium)';
-      } else if (volRaw === 'HIGH') {
-        volLine = '📊 *Volatility* : High ⚡';
-      } else {
-        volLine = `📊 *Volatility* : ${volRaw}`;
-      }
-    }
-
-    // ⏳ Horizon / duration tag
-    const durRaw = (data.DURATION || data.HORIZON || '').toUpperCase();
-    let durLine = null;
-    if (durRaw) {
-      if (durRaw === 'SCALP') {
-        durLine = '⏳ *Horizon* : Scalp (menit–jam)';
-      } else if (durRaw === 'INTRADAY') {
-        durLine = '⏳ *Horizon* : Intraday (dalam 1 hari)';
-      } else if (durRaw === 'SWING') {
-        durLine = '⏳ *Horizon* : Swing (multi-hari)';
-      } else {
-        durLine = `⏳ *Horizon* : ${durRaw}`;
-      }
-    }
-
-    // 🚨 Chart preview (opsional)
+    // optional chart
     const chartUrl = data.CHART || data.CHART_URL || null;
     let chartLine = null;
     if (chartUrl) {
@@ -379,15 +337,18 @@ bot.command('send', async (ctx) => {
     if (data.MAX_RUNTIME_MIN) {
       engineLines.push(`MAX_RUNTIME_MIN: ${data.MAX_RUNTIME_MIN}`);
     }
+    // simpan info tambahan di blok teknis saja
     if (data.RISK) engineLines.push(`RISK: ${data.RISK}`);
+    const volRaw = (data.VOL || data.VOLATILITY || '');
     if (volRaw) engineLines.push(`VOL: ${volRaw}`);
+    const durRaw = (data.DURATION || data.HORIZON || '');
     if (durRaw) engineLines.push(`DURATION: ${durRaw}`);
     if (chartUrl) engineLines.push(`CHART: ${chartUrl}`);
     engineLines.push(`STATUS: ${data.STATUS}`);
     engineLines.push('#END_PORTX_SIGNAL');
     const engineBlock = engineLines.join('\n');
 
-    // pesan yang dikirim ke group (Markdown, 1 bubble premium-style)
+    // pesan yang dikirim ke group (Markdown, 1 bubble)
     const prettyLines = [];
     prettyLines.push('🧭 *PortX Crypto Lab — Manual Futures Signal*');
     prettyLines.push('');
@@ -397,9 +358,6 @@ bot.command('send', async (ctx) => {
     prettyLines.push(`*SL*    : \`${sl}\``);
     prettyLines.push(`*TP*    : \`${tp}\``);
     prettyLines.push(`🕒 *Masa berlaku* : \`${maxRuntime} menit\``);
-    if (riskLine) prettyLines.push(riskLine);
-    if (volLine) prettyLines.push(volLine);
-    if (durLine) prettyLines.push(durLine);
     if (chartLine) {
       prettyLines.push('');
       prettyLines.push(chartLine);
@@ -985,7 +943,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send Markdown premium...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send Markdown...',
   );
 });
 
