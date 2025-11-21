@@ -9,7 +9,7 @@ const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
 
 // ADMIN whitelist (hanya ID di sini yang boleh /cancel, /close_tp, /close_sl, /list_active, /purge_signals)
 const ADMIN_IDS = [
-  6768798220, // ganti dengan user ID Telegram kamu (cek pakai /id ke bot)
+  6097241753, // ganti dengan user ID Telegram kamu (cek pakai /id ke bot)
 ];
 
 // mode bot: 'live' = kirim ke channel, 'test' = hanya preview di DM
