@@ -5,6 +5,7 @@ const axios = require('axios');
 const Jimp = require('jimp');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
 
 // key: signalId, value: signal object
 const activeSignals = new Map();
@@ -210,7 +211,12 @@ function recordHistory(signal, outcome, priceAtClose) {
   });
 }
 
-// --- Command: /status ---
+// --- /id: bantu ambil chat id ---
+bot.command('id', (ctx) => {
+  ctx.reply(`Chat ID: ${ctx.chat.id}`);
+});
+
+// --- /status: lihat sinyal aktif di chat ini ---
 bot.command('status', async (ctx) => {
   try {
     const chatId = ctx.chat.id;
@@ -243,7 +249,63 @@ bot.command('status', async (ctx) => {
   }
 });
 
-// --- Handler teks: baca sinyal ---
+// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID ---
+bot.command('send', async (ctx) => {
+  try {
+    if (!TARGET_GROUP_ID) {
+      await ctx.reply(
+        'TARGET_GROUP_ID belum diset di environment. Set dulu di Railway Variables.',
+      );
+      return;
+    }
+
+    if (ctx.chat.type !== 'private') {
+      await ctx.reply('Gunakan /send via DM ke bot, bukan di group/channel.');
+      return;
+    }
+
+    const lines = ctx.message.text.split('\n');
+    const restLines = lines.slice(1); // buang baris "/send"
+    const payload = restLines.join('\n').trim();
+
+    if (!payload) {
+      await ctx.reply(
+        [
+          'Format /send:',
+          '/send',
+          'PAIR: BTCUSDT.P',
+          'SIDE: LONG',
+          'ENTRY: 90300-90900',
+          'STOPLOSS: 89550',
+          'TAKE_PROFIT: 92300',
+          'MAX_RUNTIME_MIN: 600',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    let body = payload;
+    if (!/STATUS\s*:/.test(body.toUpperCase())) {
+      body += '\nSTATUS: WAITING';
+    }
+
+    const block = `#PORTX_SIGNAL\n${body}\n#END_PORTX_SIGNAL`;
+
+    const header = 'PortX Crypto Lab — Manual Signal\n';
+
+    await bot.telegram.sendMessage(
+      TARGET_GROUP_ID,
+      `${header}\n${block}`,
+    );
+
+    await ctx.reply('Sinyal sudah dikirim ke channel/group PortX.');
+  } catch (err) {
+    console.error('/send error:', err.message);
+    await ctx.reply('Terjadi error saat memproses /send.');
+  }
+});
+
+// --- Handler teks: baca sinyal di semua chat yang mengandung #PORTX_SIGNAL ---
 bot.on('text', async (ctx) => {
   try {
     const text = ctx.message.text;
@@ -806,7 +868,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send...',
   );
 });
 
