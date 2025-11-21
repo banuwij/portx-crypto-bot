@@ -19,7 +19,7 @@ function normalizeFuturesPair(raw) {
   if (!raw) return null;
   let p = raw.trim().toUpperCase();
 
-  // buang suffix .P kalau ada
+  // buang suffix .P kalau ada (perpetual)
   if (p.endsWith('.P')) {
     p = p.slice(0, -2);
   }
@@ -249,7 +249,7 @@ bot.command('status', async (ctx) => {
   }
 });
 
-// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID dengan format rapi (Markdown) ---
+// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID dengan format rapi (Markdown + emoji + risk/vol/horizon/chart)
 bot.command('send', async (ctx) => {
   try {
     if (!TARGET_GROUP_ID) {
@@ -279,6 +279,10 @@ bot.command('send', async (ctx) => {
           'STOPLOSS: 89550',
           'TAKE_PROFIT: 92300',
           'MAX_RUNTIME_MIN: 600',
+          'RISK: LOW/MEDIUM/HIGH (opsional)',
+          'VOL: LOW/MEDIUM/HIGH (opsional)',
+          'DURATION: SCALP/INTRADAY/SWING (opsional)',
+          'CHART: https://link-chart (opsional)',
         ].join('\n'),
       );
       return;
@@ -297,11 +301,68 @@ bot.command('send', async (ctx) => {
     }
 
     const pair = data.PAIR || 'UNKNOWN';
-    const side = data.SIDE || 'UNKNOWN';
+    const side = (data.SIDE || 'UNKNOWN').toUpperCase();
     const entry = data.ENTRY || '-';
     const sl = data.STOPLOSS || '-';
     const tp = data.TAKE_PROFIT || 'secukupnya (open)';
     const maxRuntime = data.MAX_RUNTIME_MIN || '720';
+
+    // 🔥 Risk rating
+    let riskLine = null;
+    if (data.RISK) {
+      const r = data.RISK.toUpperCase();
+      if (r === 'LOW') riskLine = '🔥 *Risk* : Low (konservatif)';
+      else if (r === 'MEDIUM' || r === 'MID')
+        riskLine = '🔥 *Risk* : Medium (seimbang)';
+      else if (r === 'HIGH')
+        riskLine = '🔥 *Risk* : High (agresif)';
+      else riskLine = `🔥 *Risk* : ${data.RISK}`;
+    }
+
+    // 📊 Volatility indicator
+    const volRaw = (data.VOL || data.VOLATILITY || '').toUpperCase();
+    let volLine = null;
+    if (volRaw) {
+      if (volRaw === 'LOW') {
+        volLine = '📊 *Volatility* : Calm (Low)';
+      } else if (volRaw === 'MEDIUM' || volRaw === 'MID') {
+        volLine = '📊 *Volatility* : Normal (Medium)';
+      } else if (volRaw === 'HIGH') {
+        volLine = '📊 *Volatility* : High ⚡';
+      } else {
+        volLine = `📊 *Volatility* : ${volRaw}`;
+      }
+    }
+
+    // ⏳ Horizon / duration tag
+    const durRaw = (data.DURATION || data.HORIZON || '').toUpperCase();
+    let durLine = null;
+    if (durRaw) {
+      if (durRaw === 'SCALP') {
+        durLine = '⏳ *Horizon* : Scalp (menit–jam)';
+      } else if (durRaw === 'INTRADAY') {
+        durLine = '⏳ *Horizon* : Intraday (dalam 1 hari)';
+      } else if (durRaw === 'SWING') {
+        durLine = '⏳ *Horizon* : Swing (multi-hari)';
+      } else {
+        durLine = `⏳ *Horizon* : ${durRaw}`;
+      }
+    }
+
+    // 🚨 Chart preview (opsional)
+    const chartUrl = data.CHART || data.CHART_URL || null;
+    let chartLine = null;
+    if (chartUrl) {
+      chartLine = `🚨 *Chart* : ${chartUrl}`;
+    }
+
+    // side emoji
+    const sideEmoji =
+      side === 'LONG'
+        ? '🟢 LONG'
+        : side === 'SHORT'
+        ? '🔴 SHORT'
+        : side;
 
     // pastikan ada STATUS
     if (!data.STATUS) {
@@ -318,20 +379,31 @@ bot.command('send', async (ctx) => {
     if (data.MAX_RUNTIME_MIN) {
       engineLines.push(`MAX_RUNTIME_MIN: ${data.MAX_RUNTIME_MIN}`);
     }
+    if (data.RISK) engineLines.push(`RISK: ${data.RISK}`);
+    if (volRaw) engineLines.push(`VOL: ${volRaw}`);
+    if (durRaw) engineLines.push(`DURATION: ${durRaw}`);
+    if (chartUrl) engineLines.push(`CHART: ${chartUrl}`);
     engineLines.push(`STATUS: ${data.STATUS}`);
     engineLines.push('#END_PORTX_SIGNAL');
     const engineBlock = engineLines.join('\n');
 
-    // pesan yang dikirim ke group (Markdown)
+    // pesan yang dikirim ke group (Markdown, 1 bubble premium-style)
     const prettyLines = [];
-    prettyLines.push('📡 *PortX Crypto Lab — Manual Futures Signal*');
+    prettyLines.push('🧭 *PortX Crypto Lab — Manual Futures Signal*');
     prettyLines.push('');
-    prettyLines.push(`*PAIR*   : \`${pair}\``);
-    prettyLines.push(`*SIDE*   : \`${side}\``);
-    prettyLines.push(`*ENTRY*  : \`${entry}\``);
-    prettyLines.push(`*SL*     : \`${sl}\``);
-    prettyLines.push(`*TP*     : \`${tp}\``);
-    prettyLines.push(`*AGE*    : \`${maxRuntime} menit\``);
+    prettyLines.push(`*PAIR*  : \`${pair}\``);
+    prettyLines.push(`*SIDE*  : *${sideEmoji}*`);
+    prettyLines.push(`*ENTRY* : \`${entry}\``);
+    prettyLines.push(`*SL*    : \`${sl}\``);
+    prettyLines.push(`*TP*    : \`${tp}\``);
+    prettyLines.push(`🕒 *Masa berlaku* : \`${maxRuntime} menit\``);
+    if (riskLine) prettyLines.push(riskLine);
+    if (volLine) prettyLines.push(volLine);
+    if (durLine) prettyLines.push(durLine);
+    if (chartLine) {
+      prettyLines.push('');
+      prettyLines.push(chartLine);
+    }
     prettyLines.push('');
     prettyLines.push('```');
     prettyLines.push(engineBlock);
@@ -445,7 +517,7 @@ bot.on('photo', async (ctx) => {
 
     // text watermark
     const font = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
-    const text = 'PortX Crypto Lab Outlook';
+    const text = 'PortX Crypto Lab — Futures Outlook';
     const textWidth = Jimp.measureText(font, text);
     const textX = Math.max(10, (width - textWidth) / 2);
     const textY = height - overlayHeight + (overlayHeight - 32) / 2;
@@ -865,8 +937,8 @@ async function sendDailyRecap() {
         h.outcome === 'TP'
           ? 'TP'
           : h.outcome === 'SL'
-            ? 'SL'
-            : 'Expired';
+          ? 'SL'
+          : 'Expired';
       lines.push(
         `• ${h.pair} ${h.side} — ${outcomeText} (Entry ${h.entryLow}-${h.entryHigh}, SL ${h.stoploss}, TP ${h.takeProfit ?? '—'})`,
       );
@@ -913,7 +985,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send Markdown...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send Markdown premium...',
   );
 });
 
