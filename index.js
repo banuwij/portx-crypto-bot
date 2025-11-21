@@ -10,6 +10,92 @@ const activeSignals = new Map();
 // histori sinyal yang sudah selesai (TP / SL / EXPIRED)
 const history = [];
 
+// --- Helper: normalisasi pair futures (BTCUSDT.P, BTCUSDT, BTC_USDT -> BTC_USDT) ---
+function normalizeFuturesPair(raw) {
+  if (!raw) return null;
+  let p = raw.trim().toUpperCase();
+
+  // buang suffix .P kalau ada
+  if (p.endsWith('.P')) {
+    p = p.slice(0, -2);
+  }
+
+  // BTC_USDT format, langsung pakai
+  if (p.includes('_')) {
+    return p;
+  }
+
+  // BTCUSDT -> BTC_USDT
+  if (p.endsWith('USDT')) {
+    const base = p.slice(0, -4); // hapus "USDT"
+    return `${base}_USDT`;
+  }
+
+  return p;
+}
+
+// --- Preset trailing otomatis berdasarkan base coin ---
+function getPresetTrailing(pair) {
+  const base = (pair.split('_')[0] || pair).toUpperCase();
+
+  // Major
+  if (['BTC', 'ETH'].includes(base)) {
+    return {
+      trailStartPct: 0.025, // 2.5%
+      trailGapPct: 0.015, // 1.5%
+    };
+  }
+
+  // High-vol majors
+  if (
+    [
+      'SOL',
+      'AVAX',
+      'TON',
+      'DOGE',
+      'OP',
+      'APT',
+      'ARB',
+      'SEI',
+      'SUI',
+      'LINK',
+    ].includes(base)
+  ) {
+    return {
+      trailStartPct: 0.035, // 3.5%
+      trailGapPct: 0.02, // 2.0%
+    };
+  }
+
+  // Micro / lainnya (default agresif)
+  if (
+    [
+      'ENA',
+      'HIGH',
+      '1INCH',
+      'ACE',
+      'ALT',
+      'BLUR',
+      'LQTY',
+      'MEME',
+      'PEPE',
+      'ORDI',
+      'WIF',
+    ].includes(base)
+  ) {
+    return {
+      trailStartPct: 0.05, // 5%
+      trailGapPct: 0.035, // 3.5%
+    };
+  }
+
+  // Fallback default
+  return {
+    trailStartPct: 0.03,
+    trailGapPct: 0.02,
+  };
+}
+
 // --- Helper: parsing blok sinyal ---
 function parseSignalBlock(text) {
   const start = text.indexOf('#PORTX_SIGNAL');
@@ -36,6 +122,9 @@ function parseSignalBlock(text) {
     return null;
   }
 
+  const normPair = normalizeFuturesPair(data.PAIR);
+  if (!normPair) return null;
+
   // ENTRY bisa single atau range
   let entryLow;
   let entryHigh;
@@ -52,19 +141,20 @@ function parseSignalBlock(text) {
   const stoploss = parseFloat(data.STOPLOSS);
   const takeProfit = data.TAKE_PROFIT ? parseFloat(data.TAKE_PROFIT) : null;
 
+  // kalau kosong, nanti diisi preset
   const trailStartPct = data.TRAIL_START_PCT
     ? parseFloat(data.TRAIL_START_PCT)
-    : 0.03; // default mulai trailing di +3%
+    : null;
   const trailGapPct = data.TRAIL_GAP_PCT
     ? parseFloat(data.TRAIL_GAP_PCT)
-    : 0.02; // default jarak trailing 2%
+    : null;
 
   const maxRuntimeMin = data.MAX_RUNTIME_MIN
     ? parseInt(data.MAX_RUNTIME_MIN, 10)
     : 720; // default 12 jam
 
   return {
-    pair: data.PAIR.toUpperCase(), // contoh futures: BTC_USDT
+    pair: normPair, // contoh futures: BTC_USDT
     side: data.SIDE.toUpperCase(), // LONG / SHORT
     entryLow,
     entryHigh,
@@ -95,6 +185,7 @@ function formatSignalStatus(signal, index) {
     `   TP    : ${tpText}`,
     `   Triggered  : ${triggeredText}`,
     `   Trailing   : ${trailText}`,
+    `   Start/GAP  : ${(signal.trailStartPct * 100).toFixed(1)}% / ${(signal.trailGapPct * 100).toFixed(1)}%`,
     `   Umur       : ${ageMin} menit`,
   ].join('\n');
 }
@@ -163,6 +254,17 @@ bot.on('text', async (ctx) => {
     const now = Date.now();
     const entryAvg = (parsed.entryLow + parsed.entryHigh) / 2;
 
+    // apply preset trailing kalau user tidak isi
+    let trailStartPct = parsed.trailStartPct;
+    let trailGapPct = parsed.trailGapPct;
+    if (!trailStartPct || Number.isNaN(trailStartPct) || trailStartPct <= 0) {
+      const preset = getPresetTrailing(parsed.pair);
+      trailStartPct = preset.trailStartPct;
+      trailGapPct = preset.trailGapPct;
+    } else if (!trailGapPct || Number.isNaN(trailGapPct) || trailGapPct <= 0) {
+      trailGapPct = 0.02; // default gap kalau user cuma isi start
+    }
+
     const signal = {
       id: signalId,
       chatId,
@@ -174,8 +276,8 @@ bot.on('text', async (ctx) => {
       entryAvg,
       stoploss: parsed.stoploss,
       takeProfit: parsed.takeProfit,
-      trailStartPct: parsed.trailStartPct,
-      trailGapPct: parsed.trailGapPct,
+      trailStartPct,
+      trailGapPct,
       maxRuntimeMin: parsed.maxRuntimeMin,
       createdAt: now,
       triggered: false,
@@ -516,7 +618,7 @@ async function sendDailyRecap() {
     const expCount = items.filter((x) => x.outcome === 'EXPIRED').length;
 
     const lines = [];
-    lines.push(`🌙 PortX Crypto Lab — Daily Recap`);
+    lines.push('🌙 PortX Crypto Lab — Daily Recap');
     lines.push(`Tanggal (WIB): ${todayStr}`);
     lines.push('');
     lines.push(`Total sinyal selesai: ${total}`);
@@ -569,7 +671,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + daily recap...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + daily recap + presets...',
   );
 });
 
