@@ -18,8 +18,8 @@ function parseSignalBlock(text) {
   const block = text
     .slice(start, end)
     .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
 
   const data = {};
   for (const line of block) {
@@ -35,9 +35,10 @@ function parseSignalBlock(text) {
   }
 
   // ENTRY bisa single atau range
-  let entryLow, entryHigh;
+  let entryLow;
+  let entryHigh;
   if (data.ENTRY.includes('-')) {
-    const [lowStr, highStr] = data.ENTRY.split('-').map(s => s.trim());
+    const [lowStr, highStr] = data.ENTRY.split('-').map((s) => s.trim());
     entryLow = parseFloat(lowStr);
     entryHigh = parseFloat(highStr);
   } else {
@@ -69,6 +70,55 @@ function parseSignalBlock(text) {
 function makeSignalId(chatId, messageId, pair) {
   return `${chatId}_${messageId}_${pair}`;
 }
+
+// --- Helper: format status sinyal untuk /status ---
+function formatSignalStatus(signal, index) {
+  const ageMin = ((Date.now() - signal.createdAt) / 60000).toFixed(1);
+  const triggeredText = signal.triggered ? 'YA' : 'BELUM';
+  const partialText = signal.partialNotified ? 'YA' : 'BELUM';
+
+  return [
+    `${index}) ${signal.pair} — ${signal.side}`,
+    `   Entry : ${signal.entryLow} - ${signal.entryHigh}`,
+    `   SL    : ${signal.stoploss}`,
+    `   Triggered  : ${triggeredText}`,
+    `   Partial TP : ${partialText}`,
+    `   Umur       : ${ageMin} menit`,
+  ].join('\n');
+}
+
+// --- Command: /status untuk lihat semua sinyal aktif di chat ini ---
+bot.command('status', async (ctx) => {
+  try {
+    const chatId = ctx.chat.id;
+
+    const signalsInChat = [];
+    let idx = 1;
+    for (const signal of activeSignals.values()) {
+      if (signal.chatId === chatId && !signal.closed) {
+        signalsInChat.push(formatSignalStatus(signal, idx));
+        idx += 1;
+      }
+    }
+
+    if (signalsInChat.length === 0) {
+      await ctx.reply(
+        [
+          '📊 PortX Crypto Lab — Status Sinyal',
+          'Tidak ada sinyal aktif untuk chat ini.',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    const header = '📊 PortX Crypto Lab — Sinyal Aktif\n';
+    const body = signalsInChat.join('\n\n');
+    await ctx.reply(header + body);
+  } catch (err) {
+    console.error('/status error:', err.message);
+    await ctx.reply('Terjadi error saat membaca status sinyal.');
+  }
+});
 
 // --- Handler: setiap ada pesan teks baru ---
 bot.on('text', async (ctx) => {
@@ -106,7 +156,7 @@ bot.on('text', async (ctx) => {
 
     await ctx.reply(
       [
-        `✅ Sinyal terdaftar — PortX Crypto Lab`,
+        '✅ Sinyal terdaftar — PortX Crypto Lab',
         `PAIR: ${signal.pair}`,
         `SIDE: ${signal.side}`,
         `ENTRY: ${signal.entryLow} - ${signal.entryHigh}`,
@@ -114,7 +164,7 @@ bot.on('text', async (ctx) => {
         `Partial TP: ${(signal.partialTpPct * 100).toFixed(1)}%`,
         `Lifetime: ${signal.maxRuntimeMin} menit`,
       ].join('\n'),
-      { reply_to_message_id: messageId }
+      { reply_to_message_id: messageId },
     );
   } catch (err) {
     console.error('Error handling text:', err);
@@ -152,8 +202,8 @@ async function checkSignals() {
           [
             `⏰ Sinyal EXPIRED — ${signal.pair}`,
             `Belum tersentuh entry dalam ${signal.maxRuntimeMin} menit.`,
-            `PortX Crypto Lab — discipline first.`,
-          ].join('\n')
+            'PortX Crypto Lab — discipline first.',
+          ].join('\n'),
         );
         signal.closed = true;
         activeSignals.delete(id);
@@ -174,12 +224,12 @@ async function checkSignals() {
             signal.chatId,
             [
               `🟢 ENTRY TRIGGERED — ${signal.pair}`,
-              `Side: LONG`,
+              'Side: LONG',
               `Entry Zone: ${signal.entryLow} - ${signal.entryHigh}`,
               `Harga saat trigger: ${price}`,
-              ``,
-              `PortX Crypto Lab — Execute with discipline.`,
-            ].join('\n')
+              '',
+              'PortX Crypto Lab — Execute with discipline.',
+            ].join('\n'),
           );
         }
 
@@ -193,10 +243,10 @@ async function checkSignals() {
               [
                 `🟡 PARTIAL TP HIT — ${signal.pair}`,
                 `Floating profit: ${(gain * 100).toFixed(2)}%`,
-                `Saran: partial TP & protect sisa posisi.`,
-                ``,
-                `PortX Crypto Lab — Protect profit, avoid greed.`,
-              ].join('\n')
+                'Saran: partial TP & protect sisa posisi.',
+                '',
+                'PortX Crypto Lab — Protect profit, avoid greed.',
+              ].join('\n'),
             );
           }
         }
@@ -208,12 +258,12 @@ async function checkSignals() {
             signal.chatId,
             [
               `🔴 STOPLOSS HIT — ${signal.pair}`,
-              `Side: LONG`,
+              'Side: LONG',
               `SL: ${signal.stoploss}`,
               `Harga saat ini: ${price}`,
-              ``,
-              `PortX Crypto Lab — Loss kecil, nafas panjang.`,
-            ].join('\n')
+              '',
+              'PortX Crypto Lab — Loss kecil, nafas panjang.',
+            ].join('\n'),
           );
           activeSignals.delete(id);
         }
@@ -231,12 +281,12 @@ async function checkSignals() {
             signal.chatId,
             [
               `🟢 ENTRY TRIGGERED — ${signal.pair}`,
-              `Side: SHORT`,
+              'Side: SHORT',
               `Entry Zone: ${signal.entryLow} - ${signal.entryHigh}`,
               `Harga saat trigger: ${price}`,
-              ``,
-              `PortX Crypto Lab — Execute with discipline.`,
-            ].join('\n')
+              '',
+              'PortX Crypto Lab — Execute with discipline.',
+            ].join('\n'),
           );
         }
 
@@ -249,12 +299,12 @@ async function checkSignals() {
               signal.chatId,
               [
                 `🟡 PARTIAL TP HIT — ${signal.pair}`,
-                `Side: SHORT`,
+                'Side: SHORT',
                 `Floating profit: ${(gain * 100).toFixed(2)}%`,
-                `Saran: partial TP & protect sisa posisi.`,
-                ``,
-                `PortX Crypto Lab — Protect profit, avoid greed.`,
-              ].join('\n')
+                'Saran: partial TP & protect sisa posisi.',
+                '',
+                'PortX Crypto Lab — Protect profit, avoid greed.',
+              ].join('\n'),
             );
           }
         }
@@ -266,12 +316,12 @@ async function checkSignals() {
             signal.chatId,
             [
               `🔴 STOPLOSS HIT — ${signal.pair}`,
-              `Side: SHORT`,
+              'Side: SHORT',
               `SL: ${signal.stoploss}`,
               `Harga saat ini: ${price}`,
-              ``,
-              `PortX Crypto Lab — Loss kecil, nafas panjang.`,
-            ].join('\n')
+              '',
+              'PortX Crypto Lab — Loss kecil, nafas panjang.',
+            ].join('\n'),
           );
           activeSignals.delete(id);
         }
