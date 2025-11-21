@@ -2,6 +2,7 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const Jimp = require('jimp');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -9,6 +10,8 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 const activeSignals = new Map();
 // histori sinyal yang sudah selesai (TP / SL / EXPIRED)
 const history = [];
+// daftar chat yang pernah pakai sinyal (untuk header pagi & recap)
+const knownChats = new Set();
 
 // --- Helper: normalisasi pair futures (BTCUSDT.P, BTCUSDT, BTC_USDT -> BTC_USDT) ---
 function normalizeFuturesPair(raw) {
@@ -207,7 +210,7 @@ function recordHistory(signal, outcome, priceAtClose) {
   });
 }
 
-// --- Command: /status untuk lihat semua sinyal aktif di chat ini ---
+// --- Command: /status ---
 bot.command('status', async (ctx) => {
   try {
     const chatId = ctx.chat.id;
@@ -240,7 +243,7 @@ bot.command('status', async (ctx) => {
   }
 });
 
-// --- Handler: setiap ada pesan teks baru ---
+// --- Handler teks: baca sinyal ---
 bot.on('text', async (ctx) => {
   try {
     const text = ctx.message.text;
@@ -250,6 +253,8 @@ bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
     const messageId = ctx.message.message_id;
     const signalId = makeSignalId(chatId, messageId, parsed.pair);
+
+    knownChats.add(chatId);
 
     const now = Date.now();
     const entryAvg = (parsed.entryLow + parsed.entryHigh) / 2;
@@ -308,9 +313,62 @@ bot.on('text', async (ctx) => {
   }
 });
 
+// --- Handler foto: auto watermark chart ---
+bot.on('photo', async (ctx) => {
+  try {
+    const chatId = ctx.chat.id;
+    knownChats.add(chatId);
+
+    const photos = ctx.message.photo;
+    if (!photos || photos.length === 0) return;
+
+    // ambil resolusi paling besar
+    const photo = photos[photos.length - 1];
+    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+    const url = fileLink.href || fileLink.toString();
+
+    const image = await Jimp.read(url);
+    const width = image.bitmap.width;
+    const height = image.bitmap.height;
+
+    // background semi transparan di bawah
+    const overlayHeight = Math.round(height * 0.08);
+    const overlay = new Jimp(width, overlayHeight, '#00000080'); // hitam transparan
+    image.composite(overlay, 0, height - overlayHeight);
+
+    // text watermark
+    const font = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
+    const text = 'PortX Crypto Lab — Futures Outlook';
+    const textWidth = Jimp.measureText(font, text);
+    const textX = Math.max(10, (width - textWidth) / 2);
+    const textY = height - overlayHeight + (overlayHeight - 32) / 2;
+
+    image.print(font, textX, textY, text);
+
+    const buffer = await image.getBufferAsync(Jimp.MIME_PNG);
+
+    const caption =
+      ctx.message.caption ||
+      'PortX Crypto Lab — Visual Outlook (auto watermarked).';
+
+    // kirim foto baru dengan watermark
+    await ctx.replyWithPhoto(
+      { source: buffer },
+      { caption, reply_to_message_id: ctx.message.message_id },
+    );
+
+    // coba hapus foto asli (kalau bot punya izin delete)
+    try {
+      await ctx.deleteMessage(ctx.message.message_id);
+    } catch (errDel) {
+      console.error('Delete original photo failed (no rights?):', errDel.message);
+    }
+  } catch (err) {
+    console.error('Error processing photo watermark:', err.message);
+  }
+});
+
 // --- Helper: ambil harga FUTURES dari MEXC ---
-// Kita pakai INDEX PRICE futures: https://contract.mexc.com/api/v1/contract/index_price/{symbol}
-// Contoh symbol: BTC_USDT, ETH_USDT, ENA_USDT
 async function fetchPrice(symbol) {
   const url = `https://contract.mexc.com/api/v1/contract/index_price/${symbol}`;
   const res = await axios.get(url);
@@ -349,8 +407,7 @@ function handleTrailing(signal, price) {
         return {
           updated: true,
           newSL: targetSL,
-          gainFromEntry:
-            (signal.highestPrice - signal.entryAvg) / signal.entryAvg,
+          gainFromEntry,
         };
       }
     }
@@ -377,8 +434,7 @@ function handleTrailing(signal, price) {
         return {
           updated: true,
           newSL: targetSL,
-          gainFromEntry:
-            (signal.entryAvg - signal.lowestPrice) / signal.entryAvg,
+          gainFromEntry,
         };
       }
     }
@@ -408,8 +464,17 @@ async function checkSignals() {
             `Belum tersentuh entry dalam ${signal.maxRuntimeMin} menit.`,
             'PortX Crypto Lab — discipline first.',
           ].join('\n'),
+          { reply_to_message_id: signal.messageId },
         );
         recordHistory(signal, 'EXPIRED', null);
+
+        // auto delete pesan sinyal asli
+        try {
+          await bot.telegram.deleteMessage(signal.chatId, signal.messageId);
+        } catch (errDel) {
+          console.error('Delete expired signal failed:', errDel.message);
+        }
+
         signal.closed = true;
         activeSignals.delete(id);
         continue;
@@ -435,6 +500,7 @@ async function checkSignals() {
               '',
               'PortX Crypto Lab — Execute with discipline.',
             ].join('\n'),
+            { reply_to_message_id: signal.messageId },
           );
         }
 
@@ -456,7 +522,15 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — TP tercapai.',
               ].join('\n'),
+              { reply_to_message_id: signal.messageId },
             );
+
+            try {
+              await bot.telegram.deleteMessage(signal.chatId, signal.messageId);
+            } catch (errDel) {
+              console.error('Delete TP signal failed:', errDel.message);
+            }
+
             activeSignals.delete(id);
             continue;
           }
@@ -474,10 +548,11 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
+              { reply_to_message_id: signal.messageId },
             );
           }
 
-          // Stoploss (awal atau hasil trailing)
+          // Stoploss
           if (price <= signal.stoploss) {
             signal.closed = true;
             recordHistory(signal, 'SL', price);
@@ -491,7 +566,15 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Loss kecil, nafas panjang.',
               ].join('\n'),
+              { reply_to_message_id: signal.messageId },
             );
+
+            try {
+              await bot.telegram.deleteMessage(signal.chatId, signal.messageId);
+            } catch (errDel) {
+              console.error('Delete SL signal failed:', errDel.message);
+            }
+
             activeSignals.delete(id);
             continue;
           }
@@ -516,6 +599,7 @@ async function checkSignals() {
               '',
               'PortX Crypto Lab — Execute with discipline.',
             ].join('\n'),
+            { reply_to_message_id: signal.messageId },
           );
         }
 
@@ -537,7 +621,15 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — TP tercapai.',
               ].join('\n'),
+              { reply_to_message_id: signal.messageId },
             );
+
+            try {
+              await bot.telegram.deleteMessage(signal.chatId, signal.messageId);
+            } catch (errDel) {
+              console.error('Delete TP signal failed:', errDel.message);
+            }
+
             activeSignals.delete(id);
             continue;
           }
@@ -555,6 +647,7 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
+              { reply_to_message_id: signal.messageId },
             );
           }
 
@@ -572,7 +665,15 @@ async function checkSignals() {
                 '',
                 'PortX Crypto Lab — Loss kecil, nafas panjang.',
               ].join('\n'),
+              { reply_to_message_id: signal.messageId },
             );
+
+            try {
+              await bot.telegram.deleteMessage(signal.chatId, signal.messageId);
+            } catch (errDel) {
+              console.error('Delete SL signal failed:', errDel.message);
+            }
+
             activeSignals.delete(id);
             continue;
           }
@@ -592,8 +693,34 @@ function getJakartaNow() {
 }
 
 let lastRecapDate = null;
+let lastHeaderDate = null;
 
-// --- Kirim recap harian ke setiap chat yang punya histori 24 jam terakhir ---
+// --- Morning Header ---
+async function sendMorningHeader() {
+  const nowJkt = getJakartaNow();
+  const dateStr = nowJkt.toISOString().slice(0, 10);
+
+  for (const chatId of knownChats.values()) {
+    const lines = [];
+    lines.push('🌅 PortX Crypto Lab — Morning Briefing');
+    lines.push(`Tanggal (WIB): ${dateStr}`);
+    lines.push('');
+    lines.push('Focus hari ini:');
+    lines.push('• Trading hanya pada setup yang jelas.');
+    lines.push('• Hormati SL, jangan kejar market.');
+    lines.push('• Gunakan leverage seperlunya saja.');
+    lines.push('');
+    lines.push('PortX Crypto Lab — Prepare, then execute.');
+
+    try {
+      await bot.telegram.sendMessage(chatId, lines.join('\n'));
+    } catch (err) {
+      console.error('Error sending morning header to chat', chatId, err.message);
+    }
+  }
+}
+
+// --- Recap harian ---
 async function sendDailyRecap() {
   const nowJkt = getJakartaNow();
   const todayStr = nowJkt.toISOString().slice(0, 10);
@@ -649,13 +776,21 @@ async function sendDailyRecap() {
   }
 }
 
-// --- Scheduler recap harian: jam 23:59 WIB ---
+// --- Scheduler recap harian & morning header ---
 async function recapScheduler() {
   const nowJkt = getJakartaNow();
   const hh = nowJkt.getHours();
   const mm = nowJkt.getMinutes();
   const todayStr = nowJkt.toISOString().slice(0, 10);
 
+  // Morning header jam 07:00 WIB
+  if (hh === 7 && mm === 0 && lastHeaderDate !== todayStr) {
+    console.log('Running morning header for', todayStr);
+    await sendMorningHeader();
+    lastHeaderDate = todayStr;
+  }
+
+  // Recap harian jam 23:59 WIB
   if (hh === 23 && mm === 59 && lastRecapDate !== todayStr) {
     console.log('Running daily recap for', todayStr);
     await sendDailyRecap();
@@ -665,13 +800,13 @@ async function recapScheduler() {
 
 // Cek sinyal tiap 5 detik
 setInterval(checkSignals, 5000);
-// Cek apakah waktunya recap tiap 60 detik
+// Cek apakah waktunya recap/header tiap 60 detik
 setInterval(recapScheduler, 60000);
 
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + daily recap + presets...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete...',
   );
 });
 
