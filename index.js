@@ -7,6 +7,8 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // key: signalId, value: signal object
 const activeSignals = new Map();
+// histori sinyal yang sudah selesai (TP / SL / EXPIRED)
+const history = [];
 
 // --- Helper: parsing blok sinyal ---
 function parseSignalBlock(text) {
@@ -62,7 +64,7 @@ function parseSignalBlock(text) {
     : 720; // default 12 jam
 
   return {
-    pair: data.PAIR.toUpperCase(),
+    pair: data.PAIR.toUpperCase(), // contoh futures: BTC_USDT
     side: data.SIDE.toUpperCase(), // LONG / SHORT
     entryLow,
     entryHigh,
@@ -84,8 +86,7 @@ function formatSignalStatus(signal, index) {
   const ageMin = ((Date.now() - signal.createdAt) / 60000).toFixed(1);
   const triggeredText = signal.triggered ? 'YA' : 'BELUM';
   const trailText = signal.trailingActive ? 'AKTIF' : 'BELUM';
-  const tpText =
-    signal.takeProfit != null ? signal.takeProfit : '—';
+  const tpText = signal.takeProfit != null ? signal.takeProfit : '—';
 
   return [
     `${index}) ${signal.pair} — ${signal.side}`,
@@ -96,6 +97,23 @@ function formatSignalStatus(signal, index) {
     `   Trailing   : ${trailText}`,
     `   Umur       : ${ageMin} menit`,
   ].join('\n');
+}
+
+// --- Helper: simpan histori sinyal yang sudah selesai ---
+function recordHistory(signal, outcome, priceAtClose) {
+  history.push({
+    chatId: signal.chatId,
+    pair: signal.pair,
+    side: signal.side,
+    outcome, // 'TP' | 'SL' | 'EXPIRED'
+    entryLow: signal.entryLow,
+    entryHigh: signal.entryHigh,
+    stoploss: signal.stoploss,
+    takeProfit: signal.takeProfit,
+    createdAt: signal.createdAt,
+    closedAt: Date.now(),
+    priceAtClose,
+  });
 }
 
 // --- Command: /status untuk lihat semua sinyal aktif di chat ini ---
@@ -149,7 +167,7 @@ bot.on('text', async (ctx) => {
       id: signalId,
       chatId,
       messageId,
-      pair: parsed.pair,
+      pair: parsed.pair, // contoh: BTC_USDT
       side: parsed.side, // LONG / SHORT
       entryLow: parsed.entryLow,
       entryHigh: parsed.entryHigh,
@@ -188,25 +206,27 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// --- Helper: ambil harga dari MEXC spot ---
-// GET https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT
+// --- Helper: ambil harga FUTURES dari MEXC ---
+// Kita pakai INDEX PRICE futures: https://contract.mexc.com/api/v1/contract/index_price/{symbol}
+// Contoh symbol: BTC_USDT, ETH_USDT, ENA_USDT
 async function fetchPrice(symbol) {
-  const url = 'https://api.mexc.com/api/v3/ticker/price';
-  const res = await axios.get(url, { params: { symbol } });
-  const price = parseFloat(res.data.price);
+  const url = `https://contract.mexc.com/api/v1/contract/index_price/${symbol}`;
+  const res = await axios.get(url);
+  if (!res.data || !res.data.data || typeof res.data.data.indexPrice === 'undefined') {
+    throw new Error(`Invalid index price response for ${symbol}`);
+  }
+  const price = parseFloat(res.data.data.indexPrice);
   if (Number.isNaN(price)) {
-    throw new Error(`Invalid price from MEXC for ${symbol}`);
+    throw new Error(`Invalid index price for ${symbol}`);
   }
   return price;
 }
 
 // --- Logic trailing stop update ---
 function handleTrailing(signal, price) {
-  // hanya bekerja setelah entry triggered
-  if (!signal.triggered) return;
+  if (!signal.triggered) return { updated: false };
 
   if (signal.side === 'LONG') {
-    // update highestPrice
     if (signal.highestPrice == null || price > signal.highestPrice) {
       signal.highestPrice = price;
     }
@@ -223,7 +243,6 @@ function handleTrailing(signal, price) {
         signal.highestPrice * (1 - signal.trailGapPct);
 
       if (targetSL > signal.stoploss) {
-        // geser SL naik
         signal.stoploss = targetSL;
         return {
           updated: true,
@@ -236,7 +255,6 @@ function handleTrailing(signal, price) {
   }
 
   if (signal.side === 'SHORT') {
-    // update lowestPrice
     if (signal.lowestPrice == null || price < signal.lowestPrice) {
       signal.lowestPrice = price;
     }
@@ -253,7 +271,6 @@ function handleTrailing(signal, price) {
         signal.lowestPrice * (1 + signal.trailGapPct);
 
       if (targetSL < signal.stoploss) {
-        // geser SL turun (lebih ketat) untuk SHORT
         signal.stoploss = targetSL;
         return {
           updated: true,
@@ -290,6 +307,7 @@ async function checkSignals() {
             'PortX Crypto Lab — discipline first.',
           ].join('\n'),
         );
+        recordHistory(signal, 'EXPIRED', null);
         signal.closed = true;
         activeSignals.delete(id);
         continue;
@@ -299,7 +317,6 @@ async function checkSignals() {
 
       // --- SIDE LONG ---
       if (signal.side === 'LONG') {
-        // Trigger entry
         if (!signal.triggered && price >= signal.entryLow && price <= signal.entryHigh) {
           signal.triggered = true;
           signal.triggeredPrice = price;
@@ -312,14 +329,13 @@ async function checkSignals() {
               `🟢 ENTRY TRIGGERED — ${signal.pair}`,
               'Side: LONG',
               `Entry Zone: ${signal.entryLow} - ${signal.entryHigh}`,
-              `Harga saat trigger: ${price}`,
+              `Harga saat trigger (futures index): ${price}`,
               '',
               'PortX Crypto Lab — Execute with discipline.',
             ].join('\n'),
           );
         }
 
-        // Kalau sudah triggered → cek TP & trailing & SL
         if (signal.triggered) {
           // TP biasa
           if (
@@ -327,13 +343,14 @@ async function checkSignals() {
             price >= signal.takeProfit
           ) {
             signal.closed = true;
+            recordHistory(signal, 'TP', price);
             await bot.telegram.sendMessage(
               signal.chatId,
               [
                 `🏁 TAKE PROFIT HIT — ${signal.pair}`,
                 'Side: LONG',
                 `TP: ${signal.takeProfit}`,
-                `Harga saat ini: ${price}`,
+                `Harga saat ini (futures index): ${price}`,
                 '',
                 'PortX Crypto Lab — TP tercapai.',
               ].join('\n'),
@@ -358,16 +375,17 @@ async function checkSignals() {
             );
           }
 
-          // Stoploss (bisa SL awal atau SL hasil trailing)
+          // Stoploss (awal atau hasil trailing)
           if (price <= signal.stoploss) {
             signal.closed = true;
+            recordHistory(signal, 'SL', price);
             await bot.telegram.sendMessage(
               signal.chatId,
               [
                 `🔴 STOPLOSS HIT — ${signal.pair}`,
                 'Side: LONG',
                 `SL: ${signal.stoploss}`,
-                `Harga saat ini: ${price}`,
+                `Harga saat ini (futures index): ${price}`,
                 '',
                 'PortX Crypto Lab — Loss kecil, nafas panjang.',
               ].join('\n'),
@@ -380,7 +398,6 @@ async function checkSignals() {
 
       // --- SIDE SHORT ---
       if (signal.side === 'SHORT') {
-        // Trigger entry (short juga pakai range)
         if (!signal.triggered && price >= signal.entryLow && price <= signal.entryHigh) {
           signal.triggered = true;
           signal.triggeredPrice = price;
@@ -393,7 +410,7 @@ async function checkSignals() {
               `🟢 ENTRY TRIGGERED — ${signal.pair}`,
               'Side: SHORT',
               `Entry Zone: ${signal.entryLow} - ${signal.entryHigh}`,
-              `Harga saat trigger: ${price}`,
+              `Harga saat trigger (futures index): ${price}`,
               '',
               'PortX Crypto Lab — Execute with discipline.',
             ].join('\n'),
@@ -407,13 +424,14 @@ async function checkSignals() {
             price <= signal.takeProfit
           ) {
             signal.closed = true;
+            recordHistory(signal, 'TP', price);
             await bot.telegram.sendMessage(
               signal.chatId,
               [
                 `🏁 TAKE PROFIT HIT — ${signal.pair}`,
                 'Side: SHORT',
                 `TP: ${signal.takeProfit}`,
-                `Harga saat ini: ${price}`,
+                `Harga saat ini (futures index): ${price}`,
                 '',
                 'PortX Crypto Lab — TP tercapai.',
               ].join('\n'),
@@ -441,13 +459,14 @@ async function checkSignals() {
           // Stoploss (short: harga naik)
           if (price >= signal.stoploss) {
             signal.closed = true;
+            recordHistory(signal, 'SL', price);
             await bot.telegram.sendMessage(
               signal.chatId,
               [
                 `🔴 STOPLOSS HIT — ${signal.pair}`,
                 'Side: SHORT',
                 `SL: ${signal.stoploss}`,
-                `Harga saat ini: ${price}`,
+                `Harga saat ini (futures index): ${price}`,
                 '',
                 'PortX Crypto Lab — Loss kecil, nafas panjang.',
               ].join('\n'),
@@ -463,12 +482,95 @@ async function checkSignals() {
   }
 }
 
+// --- Helper waktu Jakarta (UTC+7) ---
+function getJakartaNow() {
+  const now = new Date();
+  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
+  return new Date(utc + 7 * 60 * 60000);
+}
+
+let lastRecapDate = null;
+
+// --- Kirim recap harian ke setiap chat yang punya histori 24 jam terakhir ---
+async function sendDailyRecap() {
+  const nowJkt = getJakartaNow();
+  const todayStr = nowJkt.toISOString().slice(0, 10);
+  const sinceTime = Date.now() - 24 * 60 * 60000;
+
+  const byChat = new Map();
+
+  for (const h of history) {
+    if (h.closedAt < sinceTime) continue;
+    if (!byChat.has(h.chatId)) {
+      byChat.set(h.chatId, []);
+    }
+    byChat.get(h.chatId).push(h);
+  }
+
+  for (const [chatId, items] of byChat.entries()) {
+    if (items.length === 0) continue;
+
+    const total = items.length;
+    const tpCount = items.filter((x) => x.outcome === 'TP').length;
+    const slCount = items.filter((x) => x.outcome === 'SL').length;
+    const expCount = items.filter((x) => x.outcome === 'EXPIRED').length;
+
+    const lines = [];
+    lines.push(`🌙 PortX Crypto Lab — Daily Recap`);
+    lines.push(`Tanggal (WIB): ${todayStr}`);
+    lines.push('');
+    lines.push(`Total sinyal selesai: ${total}`);
+    lines.push(`TP: ${tpCount} | SL: ${slCount} | Expired: ${expCount}`);
+    lines.push('');
+    lines.push('Detail:');
+
+    for (const h of items) {
+      const outcomeText =
+        h.outcome === 'TP'
+          ? 'TP'
+          : h.outcome === 'SL'
+            ? 'SL'
+            : 'Expired';
+      lines.push(
+        `• ${h.pair} ${h.side} — ${outcomeText} (Entry ${h.entryLow}-${h.entryHigh}, SL ${h.stoploss}, TP ${h.takeProfit ?? '—'})`,
+      );
+    }
+
+    lines.push('');
+    lines.push('PortX Crypto Lab — Consistency over luck.');
+
+    try {
+      await bot.telegram.sendMessage(chatId, lines.join('\n'));
+    } catch (err) {
+      console.error('Error sending recap to chat', chatId, err.message);
+    }
+  }
+}
+
+// --- Scheduler recap harian: jam 23:59 WIB ---
+async function recapScheduler() {
+  const nowJkt = getJakartaNow();
+  const hh = nowJkt.getHours();
+  const mm = nowJkt.getMinutes();
+  const todayStr = nowJkt.toISOString().slice(0, 10);
+
+  if (hh === 23 && mm === 59 && lastRecapDate !== todayStr) {
+    console.log('Running daily recap for', todayStr);
+    await sendDailyRecap();
+    lastRecapDate = todayStr;
+  }
+}
+
 // Cek sinyal tiap 5 detik
 setInterval(checkSignals, 5000);
+// Cek apakah waktunya recap tiap 60 detik
+setInterval(recapScheduler, 60000);
 
 // Start bot
 bot.launch().then(() => {
-  console.log('PortX Crypto Lab bot running with MEXC price feed + TP + trailing SL...');
+  console.log(
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + daily recap...',
+  );
 });
 
 // Graceful stop
