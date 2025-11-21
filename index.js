@@ -3,13 +3,16 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const Jimp = require('jimp');
+const crypto = require('crypto');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
+const MEXC_API_KEY = process.env.MEXC_API_KEY;
+const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY;
 
 // ADMIN whitelist (hanya ID di sini yang boleh /cancel, /close_tp, /close_sl, /list_active, /purge_signals)
 const ADMIN_IDS = [
-  6097241753, // ganti dengan user ID Telegram kamu (cek pakai /id ke bot)
+  6097241753, // ganti dengan User ID Telegram kamu (cek pakai /id ke bot)
 ];
 
 // mode bot: 'live' = kirim ke channel, 'test' = hanya preview di DM
@@ -22,24 +25,24 @@ const history = [];
 // daftar chat yang pernah pakai sinyal (untuk header pagi & recap)
 const knownChats = new Set();
 
+// posisi futures terakhir dari MEXC (global, level akun)
+let latestPositions = [];
+
 // --- Helper: normalisasi pair futures (BTCUSDT.P, BTCUSDT, BTC_USDT -> BTC_USDT) ---
 function normalizeFuturesPair(raw) {
   if (!raw) return null;
   let p = raw.trim().toUpperCase();
 
-  // buang suffix .P kalau ada (perpetual)
   if (p.endsWith('.P')) {
     p = p.slice(0, -2);
   }
 
-  // BTC_USDT format, langsung pakai
   if (p.includes('_')) {
     return p;
   }
 
-  // BTCUSDT -> BTC_USDT
   if (p.endsWith('USDT')) {
-    const base = p.slice(0, -4); // hapus "USDT"
+    const base = p.slice(0, -4);
     return `${base}_USDT`;
   }
 
@@ -50,15 +53,13 @@ function normalizeFuturesPair(raw) {
 function getPresetTrailing(pair) {
   const base = (pair.split('_')[0] || pair).toUpperCase();
 
-  // Major
   if (['BTC', 'ETH'].includes(base)) {
     return {
-      trailStartPct: 0.025, // 2.5%
-      trailGapPct: 0.015, // 1.5%
+      trailStartPct: 0.025,
+      trailGapPct: 0.015,
     };
   }
 
-  // High-vol majors
   if (
     [
       'SOL',
@@ -74,12 +75,11 @@ function getPresetTrailing(pair) {
     ].includes(base)
   ) {
     return {
-      trailStartPct: 0.035, // 3.5%
-      trailGapPct: 0.02, // 2.0%
+      trailStartPct: 0.035,
+      trailGapPct: 0.02,
     };
   }
 
-  // Micro / lainnya (default agresif)
   if (
     [
       'ENA',
@@ -96,12 +96,11 @@ function getPresetTrailing(pair) {
     ].includes(base)
   ) {
     return {
-      trailStartPct: 0.05, // 5%
-      trailGapPct: 0.035, // 3.5%
+      trailStartPct: 0.05,
+      trailGapPct: 0.035,
     };
   }
 
-  // Fallback default
   return {
     trailStartPct: 0.03,
     trailGapPct: 0.02,
@@ -137,7 +136,6 @@ function parseSignalBlock(text) {
   const normPair = normalizeFuturesPair(data.PAIR);
   if (!normPair) return null;
 
-  // ENTRY bisa single atau range
   let entryLow;
   let entryHigh;
   if (data.ENTRY.includes('-')) {
@@ -153,7 +151,6 @@ function parseSignalBlock(text) {
   const stoploss = parseFloat(data.STOPLOSS);
   const takeProfit = data.TAKE_PROFIT ? parseFloat(data.TAKE_PROFIT) : null;
 
-  // kalau kosong, nanti diisi preset
   const trailStartPct = data.TRAIL_START_PCT
     ? parseFloat(data.TRAIL_START_PCT)
     : null;
@@ -163,11 +160,11 @@ function parseSignalBlock(text) {
 
   const maxRuntimeMin = data.MAX_RUNTIME_MIN
     ? parseInt(data.MAX_RUNTIME_MIN, 10)
-    : 720; // default 12 jam
+    : 720;
 
   return {
-    pair: normPair, // contoh futures: BTC_USDT
-    side: data.SIDE.toUpperCase(), // LONG / SHORT
+    pair: normPair,
+    side: data.SIDE.toUpperCase(),
     entryLow,
     entryHigh,
     stoploss,
@@ -190,16 +187,31 @@ function formatSignalStatus(signal, index) {
   const trailText = signal.trailingActive ? 'AKTIF' : 'BELUM';
   const tpText = signal.takeProfit != null ? signal.takeProfit : '—';
 
-  return [
-    `${index}) ${signal.pair} — ${signal.side}`,
-    `   Entry : ${signal.entryLow} - ${signal.entryHigh}`,
-    `   SL    : ${signal.stoploss}`,
-    `   TP    : ${tpText}`,
-    `   Triggered  : ${triggeredText}`,
-    `   Trailing   : ${trailText}`,
-    `   Start/GAP  : ${(signal.trailStartPct * 100).toFixed(1)}% / ${(signal.trailGapPct * 100).toFixed(1)}%`,
-    `   Umur       : ${ageMin} menit`,
-  ].join('\n');
+  const lines = [];
+  lines.push(`${index}) ${signal.pair} — ${signal.side}`);
+  lines.push(`   Entry : ${signal.entryLow} - ${signal.entryHigh}`);
+  lines.push(`   SL    : ${signal.stoploss}`);
+  lines.push(`   TP    : ${tpText}`);
+  lines.push(`   Triggered  : ${triggeredText}`);
+  lines.push(`   Trailing   : ${trailText}`);
+  lines.push(
+    `   Start/GAP  : ${(signal.trailStartPct * 100).toFixed(
+      1,
+    )}% / ${(signal.trailGapPct * 100).toFixed(1)}%`,
+  );
+  lines.push(`   Umur       : ${ageMin} menit`);
+
+  if (signal.positionInfo) {
+    const pos = signal.positionInfo;
+    lines.push('   --- Posisi Futures MEXC ---');
+    lines.push(`   Size   : ${pos.volume}`);
+    lines.push(`   Entry  : ${pos.openAvgPrice}`);
+    lines.push(`   Liq    : ${pos.liquidationPrice}`);
+    lines.push(`   PnL    : ${pos.unrealizedPnl}`);
+    lines.push(`   Lev    : ${pos.leverage}x`);
+  }
+
+  return lines.join('\n');
 }
 
 // --- Helper: simpan histori sinyal yang sudah selesai ---
@@ -208,7 +220,7 @@ function recordHistory(signal, outcome, priceAtClose) {
     chatId: signal.chatId,
     pair: signal.pair,
     side: signal.side,
-    outcome, // 'TP' | 'SL' | 'EXPIRED' | 'CANCELED'
+    outcome,
     entryLow: signal.entryLow,
     entryHigh: signal.entryHigh,
     stoploss: signal.stoploss,
@@ -233,7 +245,7 @@ function findSignalFromReplyMessage(replyMsg) {
   return null;
 }
 
-// --- /id: bantu ambil chat id ---
+// --- /id: bantu ambil chat id + user id ---
 bot.command('id', (ctx) => {
   ctx.reply(`Chat ID: ${ctx.chat.id}\nUser ID: ${ctx.from.id}`);
 });
@@ -278,7 +290,9 @@ bot.command('mode_live', async (ctx) => {
     return;
   }
   BOT_MODE = 'live';
-  await ctx.reply('Mode bot di-set ke: LIVE ✅ (sinyal /send akan dikirim ke channel).');
+  await ctx.reply(
+    'Mode bot di-set ke: LIVE ✅ (sinyal /send akan dikirim ke channel).',
+  );
 });
 
 bot.command('mode_test', async (ctx) => {
@@ -287,7 +301,9 @@ bot.command('mode_test', async (ctx) => {
     return;
   }
   BOT_MODE = 'test';
-  await ctx.reply('Mode bot di-set ke: TEST 🧪 (sinyal /send hanya preview di DM, tidak dikirim ke channel).');
+  await ctx.reply(
+    'Mode bot di-set ke: TEST 🧪 (sinyal /send hanya preview di DM, tidak dikirim ke channel).',
+  );
 });
 
 bot.command('mode_status', async (ctx) => {
@@ -375,7 +391,9 @@ bot.command('performance', async (ctx) => {
   lines.push(`Canceled: ${canceledCount}`);
   lines.push(`Winrate (TP/total): ${winrate}%`);
   lines.push('');
-  lines.push('Catatan: ini berdasarkan sinyal yang sudah selesai (TP / SL / EXPIRED / CANCELED) di chat ini.');
+  lines.push(
+    'Catatan: ini berdasarkan sinyal yang sudah selesai (TP / SL / EXPIRED / CANCELED) di chat ini.',
+  );
 
   await ctx.reply(lines.join('\n'));
 });
@@ -462,14 +480,20 @@ bot.command('cancel', async (ctx) => {
     recordHistory(foundSignal, 'CANCELED', null);
 
     try {
-      await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.messageId);
+      await bot.telegram.deleteMessage(
+        foundSignal.chatId,
+        foundSignal.messageId,
+      );
     } catch (err) {
       console.error('Gagal hapus pesan sinyal:', err.message);
     }
 
     try {
       if (foundSignal.anchorMessageId) {
-        await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.anchorMessageId);
+        await bot.telegram.deleteMessage(
+          foundSignal.chatId,
+          foundSignal.anchorMessageId,
+        );
       }
     } catch (err) {
       console.error('Gagal hapus anchor:', err.message);
@@ -485,7 +509,7 @@ bot.command('cancel', async (ctx) => {
         'Alasan: Dibatalin manual oleh admin.',
         'PortX Crypto Lab — discipline first.',
       ].join('\n'),
-      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id }
+      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id },
     );
   } catch (err) {
     console.error('/cancel error:', err.message);
@@ -521,14 +545,20 @@ bot.command('close_tp', async (ctx) => {
     activeSignals.delete(foundSignal.id);
 
     try {
-      await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.messageId);
+      await bot.telegram.deleteMessage(
+        foundSignal.chatId,
+        foundSignal.messageId,
+      );
     } catch (err) {
       console.error('Gagal hapus pesan sinyal:', err.message);
     }
 
     try {
       if (foundSignal.anchorMessageId) {
-        await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.anchorMessageId);
+        await bot.telegram.deleteMessage(
+          foundSignal.chatId,
+          foundSignal.anchorMessageId,
+        );
       }
     } catch (err) {
       console.error('Gagal hapus anchor:', err.message);
@@ -541,7 +571,7 @@ bot.command('close_tp', async (ctx) => {
         '',
         'PortX Crypto Lab — take profit, protect capital.',
       ].join('\n'),
-      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id }
+      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id },
     );
   } catch (err) {
     console.error('/close_tp error:', err.message);
@@ -577,14 +607,20 @@ bot.command('close_sl', async (ctx) => {
     activeSignals.delete(foundSignal.id);
 
     try {
-      await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.messageId);
+      await bot.telegram.deleteMessage(
+        foundSignal.chatId,
+        foundSignal.messageId,
+      );
     } catch (err) {
       console.error('Gagal hapus pesan sinyal:', err.message);
     }
 
     try {
       if (foundSignal.anchorMessageId) {
-        await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.anchorMessageId);
+        await bot.telegram.deleteMessage(
+          foundSignal.chatId,
+          foundSignal.anchorMessageId,
+        );
       }
     } catch (err) {
       console.error('Gagal hapus anchor:', err.message);
@@ -597,7 +633,7 @@ bot.command('close_sl', async (ctx) => {
         '',
         'PortX Crypto Lab — loss kecil, napas panjang.',
       ].join('\n'),
-      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id }
+      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id },
     );
   } catch (err) {
     console.error('/close_sl error:', err.message);
@@ -610,7 +646,9 @@ bot.command('list_active', async (ctx) => {
   const fromId = ctx.from.id;
 
   if (!ADMIN_IDS.includes(fromId)) {
-    await ctx.reply('❌ Kamu tidak punya izin untuk melihat semua sinyal aktif global.');
+    await ctx.reply(
+      '❌ Kamu tidak punya izin untuk melihat semua sinyal aktif global.',
+    );
     return;
   }
 
@@ -650,7 +688,9 @@ bot.command('purge_signals', async (ctx) => {
     const fromId = ctx.from.id;
 
     if (!ADMIN_IDS.includes(fromId)) {
-      await ctx.reply('❌ Kamu tidak punya izin untuk purge semua sinyal.');
+      await ctx.reply(
+        '❌ Kamu tidak punya izin untuk purge semua sinyal.',
+      );
       return;
     }
 
@@ -712,7 +752,7 @@ bot.command('send', async (ctx) => {
     }
 
     const lines = ctx.message.text.split('\n');
-    const restLines = lines.slice(1); // buang baris "/send"
+    const restLines = lines.slice(1);
     const payload = restLines.join('\n').trim();
 
     if (!payload) {
@@ -736,7 +776,6 @@ bot.command('send', async (ctx) => {
       return;
     }
 
-    // parsing simple "KEY: VALUE"
     const data = {};
     for (const raw of payload.split('\n')) {
       const line = raw.trim();
@@ -784,9 +823,9 @@ bot.command('send', async (ctx) => {
     }
     if (data.NOTE) engineLines.push(`NOTE: ${data.NOTE}`);
     if (data.RISK) engineLines.push(`RISK: ${data.RISK}`);
-    const volRaw = (data.VOL || data.VOLATILITY || '');
+    const volRaw = data.VOL || data.VOLATILITY || '';
     if (volRaw) engineLines.push(`VOL: ${volRaw}`);
-    const durRaw = (data.DURATION || data.HORIZON || '');
+    const durRaw = data.DURATION || data.HORIZON || '';
     if (durRaw) engineLines.push(`DURATION: ${durRaw}`);
     if (chartUrl) engineLines.push(`CHART: ${chartUrl}`);
     engineLines.push(`STATUS: ${data.STATUS}`);
@@ -819,11 +858,9 @@ bot.command('send', async (ctx) => {
 
     if (BOT_MODE === 'test') {
       await ctx.reply(
-        [
-          '🧪 *TEST MODE* — sinyal *TIDAK* dikirim ke channel.',
-          '',
-          fullMessage,
-        ].join('\n'),
+        ['🧪 *TEST MODE* — sinyal *TIDAK* dikirim ke channel.', '', fullMessage].join(
+          '\n',
+        ),
         { parse_mode: 'Markdown' },
       );
     } else {
@@ -885,6 +922,7 @@ bot.on('text', async (ctx) => {
       lowestPrice: null,
       closed: false,
       anchorMessageId: null,
+      positionInfo: null,
     };
 
     const anchor = await ctx.reply(
@@ -967,7 +1005,7 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// --- Helper: ambil harga FUTURES dari MEXC ---
+// --- Helper: ambil harga FUTURES dari MEXC (index price) ---
 async function fetchPrice(symbol) {
   const url = `https://contract.mexc.com/api/v1/contract/index_price/${symbol}`;
   const res = await axios.get(url);
@@ -1044,7 +1082,7 @@ function handleTrailing(signal, price) {
   return { updated: false };
 }
 
-// --- Logic cek sinyal ---
+// --- Logic cek sinyal (TP/SL/Trailing/Expired) ---
 async function checkSignals() {
   if (activeSignals.size === 0) return;
 
@@ -1083,7 +1121,6 @@ async function checkSignals() {
 
       const price = await fetchPrice(signal.pair);
 
-      // --- SIDE LONG ---
       if (signal.side === 'LONG') {
         if (
           !signal.triggered &&
@@ -1144,7 +1181,9 @@ async function checkSignals() {
                 `🔧 TRAILING SL UPDATED — ${signal.pair}`,
                 'Side: LONG',
                 `SL baru: ${trailResult.newSL.toFixed(4)}`,
-                `Max gain tercatat: ${(trailResult.gainFromEntry * 100).toFixed(2)}%`,
+                `Max gain tercatat: ${(trailResult.gainFromEntry * 100).toFixed(
+                  2,
+                )}%`,
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
@@ -1180,7 +1219,6 @@ async function checkSignals() {
         }
       }
 
-      // --- SIDE SHORT ---
       if (signal.side === 'SHORT') {
         if (
           !signal.triggered &&
@@ -1241,7 +1279,9 @@ async function checkSignals() {
                 `🔧 TRAILING SL UPDATED — ${signal.pair}`,
                 'Side: SHORT',
                 `SL baru: ${trailResult.newSL.toFixed(4)}`,
-                `Max gain tercatat: ${(trailResult.gainFromEntry * 100).toFixed(2)}%`,
+                `Max gain tercatat: ${(trailResult.gainFromEntry * 100).toFixed(
+                  2,
+                )}%`,
                 '',
                 'PortX Crypto Lab — Protect profit, avoid greed.',
               ].join('\n'),
@@ -1375,6 +1415,174 @@ async function sendDailyRecap() {
   }
 }
 
+// --- MEXC Futures: get positions (READ ONLY) ---
+async function mexcGetPositions() {
+  if (!MEXC_API_KEY || !MEXC_SECRET_KEY) {
+    throw new Error('MEXC_API_KEY atau MEXC_SECRET_KEY belum diset di .env');
+  }
+
+  const reqTime = Date.now().toString();
+  const method = 'GET';
+  const path = '/api/v1/private/position/list';
+  const baseUrl = 'https://contract.mexc.com';
+  const signStr = reqTime + method + path;
+
+  const signature = crypto
+    .createHmac('sha256', MEXC_SECRET_KEY)
+    .update(signStr)
+    .digest('hex');
+
+  const headers = {
+    'Content-Type': 'application/json',
+    ApiKey: MEXC_API_KEY,
+    'Request-Time': reqTime,
+    Signature: signature,
+  };
+
+  const res = await axios.get(baseUrl + path, { headers });
+  if (!res.data || !Array.isArray(res.data.data)) {
+    return [];
+  }
+
+  return res.data.data;
+}
+
+// --- Auto-sync posisi MEXC ke sinyal (auto detect posisi + PnL) ---
+async function syncMexcPositionsToSignals() {
+  try {
+    const positions = await mexcGetPositions();
+    latestPositions = positions;
+
+    for (const s of activeSignals.values()) {
+      s.positionInfo = null;
+    }
+
+    for (const p of positions) {
+      const symbol = p.symbol; // contoh: BTC_USDT
+      const side = p.positionType === 1 ? 'LONG' : 'SHORT';
+
+      for (const s of activeSignals.values()) {
+        if (s.pair === symbol && s.side === side && !s.closed) {
+          s.positionInfo = {
+            symbol: p.symbol,
+            volume: p.volume,
+            openAvgPrice: p.openAvgPrice,
+            liquidationPrice: p.liquidationPrice,
+            unrealizedPnl: p.unrealizedPnl,
+            leverage: p.leverage,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error syncMexcPositionsToSignals:', err.message);
+  }
+}
+
+// --- /mypos: lihat posisi futures aktif + PnL ---
+bot.command('mypos', async (ctx) => {
+  try {
+    const positions = await mexcGetPositions();
+    latestPositions = positions;
+
+    if (!positions || positions.length === 0) {
+      await ctx.reply('❌ Tidak ada posisi Futures yang sedang aktif di akun MEXC.');
+      return;
+    }
+
+    let out = '📊 *Posisi Futures Aktif — MEXC*\n\n';
+
+    for (const p of positions) {
+      const side = p.positionType === 1 ? '🟢 LONG' : '🔴 SHORT';
+      out += [
+        `• *${p.symbol}*`,
+        `  Side  : ${side}`,
+        `  Size  : ${p.volume}`,
+        `  Entry : ${p.openAvgPrice}`,
+        `  Liq   : ${p.liquidationPrice}`,
+        `  Lev   : ${p.leverage}x`,
+        `  PnL   : ${p.unrealizedPnl}`,
+        '',
+      ].join('\n');
+    }
+
+    await ctx.reply(out, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('/mypos error:', err.message);
+    await ctx.reply('⚠️ Error membaca posisi MEXC. Cek API key & secret.');
+  }
+});
+
+// --- Hourly portfolio summary ke admin (auto summary per 1 jam) ---
+async function sendHourlyPortfolioSummary() {
+  try {
+    if (!MEXC_API_KEY || !MEXC_SECRET_KEY) {
+      return;
+    }
+
+    const positions = await mexcGetPositions();
+    latestPositions = positions;
+
+    const nowJkt = getJakartaNow();
+    const timeStr = nowJkt.toISOString().replace('T', ' ').slice(0, 16);
+
+    if (!positions || positions.length === 0) {
+      const msg =
+        `📊 PortX Crypto Lab — Portfolio Summary (MEXC Futures)\n` +
+        `Waktu (WIB): ${timeStr}\n\n` +
+        `Tidak ada posisi aktif saat ini.`;
+      for (const adminId of ADMIN_IDS) {
+        try {
+          await bot.telegram.sendMessage(adminId, msg, {
+            parse_mode: 'Markdown',
+          });
+        } catch (err) {
+          console.error('Send summary (no pos) failed to admin', adminId, err.message);
+        }
+      }
+      return;
+    }
+
+    let totalUnreal = 0;
+    let totalMargin = 0;
+
+    for (const p of positions) {
+      totalUnreal += Number(p.unrealizedPnl || 0);
+      totalMargin += Number(p.margin || 0);
+    }
+
+    let msg = '📊 *PortX Crypto Lab — Portfolio Summary (MEXC Futures)*\n';
+    msg += `Waktu (WIB): ${timeStr}\n\n`;
+    msg += `Total Margin   : ${totalMargin}\n`;
+    msg += `Unrealized PnL : ${totalUnreal}\n\n`;
+    msg += `Detail posisi:\n\n`;
+
+    for (const p of positions) {
+      const side = p.positionType === 1 ? '🟢 LONG' : '🔴 SHORT';
+      msg += [
+        `• *${p.symbol}*`,
+        `  Side  : ${side}`,
+        `  Size  : ${p.volume}`,
+        `  Entry : ${p.openAvgPrice}`,
+        `  Liq   : ${p.liquidationPrice}`,
+        `  Lev   : ${p.leverage}x`,
+        `  PnL   : ${p.unrealizedPnl}`,
+        '',
+      ].join('\n');
+    }
+
+    for (const adminId of ADMIN_IDS) {
+      try {
+        await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
+      } catch (err) {
+        console.error('Send summary failed to admin', adminId, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('sendHourlyPortfolioSummary error:', err.message);
+  }
+}
+
 // --- Scheduler recap harian & morning header ---
 async function recapScheduler() {
   const nowJkt = getJakartaNow();
@@ -1399,11 +1607,15 @@ async function recapScheduler() {
 setInterval(checkSignals, 5000);
 // Cek apakah waktunya recap/header tiap 60 detik
 setInterval(recapScheduler, 60000);
+// Sync posisi MEXC ke sinyal tiap 60 detik (auto detect posisi & update PnL di /status)
+setInterval(syncMexcPositionsToSignals, 60000);
+// Portfolio summary tiap 1 jam
+setInterval(sendHourlyPortfolioSummary, 60 * 60 * 1000);
 
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running (MEXC futures index + TP/SL/trailing + presets + daily recap + morning header + watermark + auto-delete + /send premium + mode live/test + thread anchor + FAQ + performance + export CSV + cancel/close/purge)...',
+    'PortX Crypto Lab bot running (MEXC futures index + TP/SL/trailing + presets + daily recap + morning header + watermark + /send premium + mode live/test + thread anchor + FAQ + performance + export CSV + cancel/close/purge + MEXC positions sync + hourly portfolio summary)...',
   );
 });
 
