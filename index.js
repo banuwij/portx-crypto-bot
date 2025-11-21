@@ -249,7 +249,7 @@ bot.command('status', async (ctx) => {
   }
 });
 
-// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID ---
+// --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID dengan format rapi (Markdown) ---
 bot.command('send', async (ctx) => {
   try {
     if (!TARGET_GROUP_ID) {
@@ -284,19 +284,64 @@ bot.command('send', async (ctx) => {
       return;
     }
 
-    let body = payload;
-    if (!/STATUS\s*:/.test(body.toUpperCase())) {
-      body += '\nSTATUS: WAITING';
+    // parsing simple "KEY: VALUE"
+    const data = {};
+    for (const raw of payload.split('\n')) {
+      const line = raw.trim();
+      if (!line) continue;
+      const idx = line.indexOf(':');
+      if (idx === -1) continue;
+      const key = line.slice(0, idx).trim().toUpperCase();
+      const value = line.slice(idx + 1).trim();
+      data[key] = value;
     }
 
-    const block = `#PORTX_SIGNAL\n${body}\n#END_PORTX_SIGNAL`;
+    const pair = data.PAIR || 'UNKNOWN';
+    const side = data.SIDE || 'UNKNOWN';
+    const entry = data.ENTRY || '-';
+    const sl = data.STOPLOSS || '-';
+    const tp = data.TAKE_PROFIT || 'secukupnya (open)';
+    const maxRuntime = data.MAX_RUNTIME_MIN || '720';
 
-    const header = 'PortX Crypto Lab — Manual Signal\n';
+    // pastikan ada STATUS
+    if (!data.STATUS) {
+      data.STATUS = 'WAITING';
+    }
 
-    await bot.telegram.sendMessage(
-      TARGET_GROUP_ID,
-      `${header}\n${block}`,
-    );
+    // susun blok engine untuk bot (akan dibaca parser)
+    const engineLines = ['#PORTX_SIGNAL'];
+    if (data.PAIR) engineLines.push(`PAIR: ${data.PAIR}`);
+    if (data.SIDE) engineLines.push(`SIDE: ${data.SIDE}`);
+    if (data.ENTRY) engineLines.push(`ENTRY: ${data.ENTRY}`);
+    if (data.STOPLOSS) engineLines.push(`STOPLOSS: ${data.STOPLOSS}`);
+    if (data.TAKE_PROFIT) engineLines.push(`TAKE_PROFIT: ${data.TAKE_PROFIT}`);
+    if (data.MAX_RUNTIME_MIN) {
+      engineLines.push(`MAX_RUNTIME_MIN: ${data.MAX_RUNTIME_MIN}`);
+    }
+    engineLines.push(`STATUS: ${data.STATUS}`);
+    engineLines.push('#END_PORTX_SIGNAL');
+    const engineBlock = engineLines.join('\n');
+
+    // pesan yang dikirim ke group (Markdown)
+    const prettyLines = [];
+    prettyLines.push('📡 *PortX Crypto Lab — Manual Futures Signal*');
+    prettyLines.push('');
+    prettyLines.push(`*PAIR*   : \`${pair}\``);
+    prettyLines.push(`*SIDE*   : \`${side}\``);
+    prettyLines.push(`*ENTRY*  : \`${entry}\``);
+    prettyLines.push(`*SL*     : \`${sl}\``);
+    prettyLines.push(`*TP*     : \`${tp}\``);
+    prettyLines.push(`*AGE*    : \`${maxRuntime} menit\``);
+    prettyLines.push('');
+    prettyLines.push('```');
+    prettyLines.push(engineBlock);
+    prettyLines.push('```');
+
+    const fullMessage = prettyLines.join('\n');
+
+    await bot.telegram.sendMessage(TARGET_GROUP_ID, fullMessage, {
+      parse_mode: 'Markdown',
+    });
 
     await ctx.reply('Sinyal sudah dikirim ke channel/group PortX.');
   } catch (err) {
@@ -400,7 +445,7 @@ bot.on('photo', async (ctx) => {
 
     // text watermark
     const font = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
-    const text = 'PortX Crypto Lab — Futures Outlook';
+    const text = 'PortX Crypto Lab Outlook';
     const textWidth = Jimp.measureText(font, text);
     const textX = Math.max(10, (width - textWidth) / 2);
     const textY = height - overlayHeight + (overlayHeight - 32) / 2;
@@ -868,7 +913,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send...',
+    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send Markdown...',
   );
 });
 
