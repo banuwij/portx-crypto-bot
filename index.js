@@ -7,12 +7,17 @@ const Jimp = require('jimp');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID;
 
+// ADMIN whitelist (hanya ID di sini yang boleh /cancel, /close_tp, /close_sl, /list_active, /purge_signals)
+const ADMIN_IDS = [
+  6768798220, // ganti dengan user ID Telegram kamu (cek pakai /id ke bot)
+];
+
 // mode bot: 'live' = kirim ke channel, 'test' = hanya preview di DM
 let BOT_MODE = 'live';
 
 // key: signalId, value: signal object
 const activeSignals = new Map();
-// histori sinyal yang sudah selesai (TP / SL / EXPIRED)
+// histori sinyal yang sudah selesai (TP / SL / EXPIRED / CANCELED)
 const history = [];
 // daftar chat yang pernah pakai sinyal (untuk header pagi & recap)
 const knownChats = new Set();
@@ -203,7 +208,7 @@ function recordHistory(signal, outcome, priceAtClose) {
     chatId: signal.chatId,
     pair: signal.pair,
     side: signal.side,
-    outcome, // 'TP' | 'SL' | 'EXPIRED'
+    outcome, // 'TP' | 'SL' | 'EXPIRED' | 'CANCELED'
     entryLow: signal.entryLow,
     entryHigh: signal.entryHigh,
     stoploss: signal.stoploss,
@@ -214,9 +219,23 @@ function recordHistory(signal, outcome, priceAtClose) {
   });
 }
 
+// --- Helper: cari sinyal dari reply ---
+function findSignalFromReplyMessage(replyMsg) {
+  if (!replyMsg) return null;
+  for (const s of activeSignals.values()) {
+    if (
+      s.messageId === replyMsg.message_id ||
+      s.anchorMessageId === replyMsg.message_id
+    ) {
+      return s;
+    }
+  }
+  return null;
+}
+
 // --- /id: bantu ambil chat id ---
 bot.command('id', (ctx) => {
-  ctx.reply(`Chat ID: ${ctx.chat.id}`);
+  ctx.reply(`Chat ID: ${ctx.chat.id}\nUser ID: ${ctx.from.id}`);
 });
 
 // --- /status: lihat sinyal aktif di chat ini ---
@@ -343,6 +362,7 @@ bot.command('performance', async (ctx) => {
   const tpCount = items.filter((x) => x.outcome === 'TP').length;
   const slCount = items.filter((x) => x.outcome === 'SL').length;
   const expCount = items.filter((x) => x.outcome === 'EXPIRED').length;
+  const canceledCount = items.filter((x) => x.outcome === 'CANCELED').length;
   const winrate = total > 0 ? ((tpCount / total) * 100).toFixed(2) : '0.00';
 
   const lines = [];
@@ -352,9 +372,10 @@ bot.command('performance', async (ctx) => {
   lines.push(`TP: ${tpCount}`);
   lines.push(`SL: ${slCount}`);
   lines.push(`Expired: ${expCount}`);
+  lines.push(`Canceled: ${canceledCount}`);
   lines.push(`Winrate (TP/total): ${winrate}%`);
   lines.push('');
-  lines.push('Catatan: ini berdasarkan sinyal yang sudah selesai (TP / SL / EXPIRED) di chat ini.');
+  lines.push('Catatan: ini berdasarkan sinyal yang sudah selesai (TP / SL / EXPIRED / CANCELED) di chat ini.');
 
   await ctx.reply(lines.join('\n'));
 });
@@ -412,6 +433,267 @@ bot.command('export', async (ctx) => {
     },
     { caption: 'Export histori sinyal PortX Crypto Lab (CSV).' },
   );
+});
+
+// --- /cancel: batalkan sinyal (admin only, reply-based) ---
+bot.command('cancel', async (ctx) => {
+  try {
+    const fromId = ctx.from.id;
+
+    if (!ADMIN_IDS.includes(fromId)) {
+      await ctx.reply('❌ Kamu tidak punya izin untuk membatalkan sinyal.');
+      return;
+    }
+
+    if (!ctx.message.reply_to_message) {
+      await ctx.reply('Cara pakai:\nReply ke pesan sinyal → ketik /cancel');
+      return;
+    }
+
+    const replyMsg = ctx.message.reply_to_message;
+    const foundSignal = findSignalFromReplyMessage(replyMsg);
+
+    if (!foundSignal) {
+      await ctx.reply('❌ Tidak menemukan sinyal yang bisa dibatalkan.');
+      return;
+    }
+
+    foundSignal.closed = true;
+    recordHistory(foundSignal, 'CANCELED', null);
+
+    try {
+      await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.messageId);
+    } catch (err) {
+      console.error('Gagal hapus pesan sinyal:', err.message);
+    }
+
+    try {
+      if (foundSignal.anchorMessageId) {
+        await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.anchorMessageId);
+      }
+    } catch (err) {
+      console.error('Gagal hapus anchor:', err.message);
+    }
+
+    activeSignals.delete(foundSignal.id);
+
+    await ctx.reply(
+      [
+        `🛑 *Sinyal DIBATALKAN* — ${foundSignal.pair}`,
+        `Side: ${foundSignal.side}`,
+        '',
+        'Alasan: Dibatalin manual oleh admin.',
+        'PortX Crypto Lab — discipline first.',
+      ].join('\n'),
+      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id }
+    );
+  } catch (err) {
+    console.error('/cancel error:', err.message);
+    await ctx.reply('Terjadi error saat membatalkan sinyal.');
+  }
+});
+
+// --- /close_tp: paksa close sebagai TP (admin only, reply-based) ---
+bot.command('close_tp', async (ctx) => {
+  try {
+    const fromId = ctx.from.id;
+
+    if (!ADMIN_IDS.includes(fromId)) {
+      await ctx.reply('❌ Kamu tidak punya izin untuk close TP manual.');
+      return;
+    }
+
+    if (!ctx.message.reply_to_message) {
+      await ctx.reply('Cara pakai:\nReply ke pesan sinyal → ketik /close_tp');
+      return;
+    }
+
+    const replyMsg = ctx.message.reply_to_message;
+    const foundSignal = findSignalFromReplyMessage(replyMsg);
+
+    if (!foundSignal) {
+      await ctx.reply('❌ Tidak menemukan sinyal yang bisa di-close TP.');
+      return;
+    }
+
+    foundSignal.closed = true;
+    recordHistory(foundSignal, 'TP', null);
+    activeSignals.delete(foundSignal.id);
+
+    try {
+      await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.messageId);
+    } catch (err) {
+      console.error('Gagal hapus pesan sinyal:', err.message);
+    }
+
+    try {
+      if (foundSignal.anchorMessageId) {
+        await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.anchorMessageId);
+      }
+    } catch (err) {
+      console.error('Gagal hapus anchor:', err.message);
+    }
+
+    await ctx.reply(
+      [
+        `🏁 *Sinyal DICLOSE sebagai TP (manual)* — ${foundSignal.pair}`,
+        `Side: ${foundSignal.side}`,
+        '',
+        'PortX Crypto Lab — take profit, protect capital.',
+      ].join('\n'),
+      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id }
+    );
+  } catch (err) {
+    console.error('/close_tp error:', err.message);
+    await ctx.reply('Terjadi error saat close TP manual.');
+  }
+});
+
+// --- /close_sl: paksa close sebagai SL (admin only, reply-based) ---
+bot.command('close_sl', async (ctx) => {
+  try {
+    const fromId = ctx.from.id;
+
+    if (!ADMIN_IDS.includes(fromId)) {
+      await ctx.reply('❌ Kamu tidak punya izin untuk close SL manual.');
+      return;
+    }
+
+    if (!ctx.message.reply_to_message) {
+      await ctx.reply('Cara pakai:\nReply ke pesan sinyal → ketik /close_sl');
+      return;
+    }
+
+    const replyMsg = ctx.message.reply_to_message;
+    const foundSignal = findSignalFromReplyMessage(replyMsg);
+
+    if (!foundSignal) {
+      await ctx.reply('❌ Tidak menemukan sinyal yang bisa di-close SL.');
+      return;
+    }
+
+    foundSignal.closed = true;
+    recordHistory(foundSignal, 'SL', null);
+    activeSignals.delete(foundSignal.id);
+
+    try {
+      await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.messageId);
+    } catch (err) {
+      console.error('Gagal hapus pesan sinyal:', err.message);
+    }
+
+    try {
+      if (foundSignal.anchorMessageId) {
+        await bot.telegram.deleteMessage(foundSignal.chatId, foundSignal.anchorMessageId);
+      }
+    } catch (err) {
+      console.error('Gagal hapus anchor:', err.message);
+    }
+
+    await ctx.reply(
+      [
+        `🔴 *Sinyal DICLOSE sebagai SL (manual)* — ${foundSignal.pair}`,
+        `Side: ${foundSignal.side}`,
+        '',
+        'PortX Crypto Lab — loss kecil, napas panjang.',
+      ].join('\n'),
+      { parse_mode: 'Markdown', reply_to_message_id: replyMsg.message_id }
+    );
+  } catch (err) {
+    console.error('/close_sl error:', err.message);
+    await ctx.reply('Terjadi error saat close SL manual.');
+  }
+});
+
+// --- /list_active: list semua sinyal aktif (admin only, seluruh grup) ---
+bot.command('list_active', async (ctx) => {
+  const fromId = ctx.from.id;
+
+  if (!ADMIN_IDS.includes(fromId)) {
+    await ctx.reply('❌ Kamu tidak punya izin untuk melihat semua sinyal aktif global.');
+    return;
+  }
+
+  if (activeSignals.size === 0) {
+    await ctx.reply('Tidak ada sinyal aktif (global).');
+    return;
+  }
+
+  const lines = [];
+  lines.push('📋 *Daftar Sinyal Aktif (Global)*');
+  lines.push('');
+
+  let idx = 1;
+  for (const s of activeSignals.values()) {
+    const ageMin = ((Date.now() - s.createdAt) / 60000).toFixed(1);
+    const trig = s.triggered ? 'YA' : 'BELUM';
+    lines.push(
+      [
+        `${idx}) ChatID: ${s.chatId}`,
+        `   Pair : ${s.pair}`,
+        `   Side : ${s.side}`,
+        `   Entry: ${s.entryLow} - ${s.entryHigh}`,
+        `   SL   : ${s.stoploss}`,
+        `   TP   : ${s.takeProfit != null ? s.takeProfit : '—'}`,
+        `   Triggered: ${trig}, Umur: ${ageMin} mnt`,
+      ].join('\n'),
+    );
+    idx += 1;
+  }
+
+  await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+});
+
+// --- /purge_signals: hapus semua sinyal aktif (admin only, hati-hati) ---
+bot.command('purge_signals', async (ctx) => {
+  try {
+    const fromId = ctx.from.id;
+
+    if (!ADMIN_IDS.includes(fromId)) {
+      await ctx.reply('❌ Kamu tidak punya izin untuk purge semua sinyal.');
+      return;
+    }
+
+    if (activeSignals.size === 0) {
+      await ctx.reply('Tidak ada sinyal aktif untuk dipurge.');
+      return;
+    }
+
+    const ids = Array.from(activeSignals.keys());
+    let count = 0;
+
+    for (const id of ids) {
+      const s = activeSignals.get(id);
+      if (!s) continue;
+
+      s.closed = true;
+      recordHistory(s, 'CANCELED', null);
+
+      try {
+        await bot.telegram.deleteMessage(s.chatId, s.messageId);
+      } catch (err) {
+        console.error('Gagal hapus pesan sinyal (purge):', err.message);
+      }
+
+      try {
+        if (s.anchorMessageId) {
+          await bot.telegram.deleteMessage(s.chatId, s.anchorMessageId);
+        }
+      } catch (err) {
+        console.error('Gagal hapus anchor (purge):', err.message);
+      }
+
+      activeSignals.delete(id);
+      count += 1;
+    }
+
+    await ctx.reply(
+      `🧹 Purge selesai. Total sinyal yang dibatalkan: ${count}.\nPortX Crypto Lab — bersihkan buku.`,
+    );
+  } catch (err) {
+    console.error('/purge_signals error:', err.message);
+    await ctx.reply('Terjadi error saat purge sinyal.');
+  }
 });
 
 // --- /send: DM ke bot → kirim sinyal ke TARGET_GROUP_ID (Markdown premium, dengan NOTE & Chart) ---
@@ -474,14 +756,12 @@ bot.command('send', async (ctx) => {
     const maxRuntime = data.MAX_RUNTIME_MIN || '720';
     const note = data.NOTE || null;
 
-    // optional chart
     const chartUrl = data.CHART || data.CHART_URL || null;
     let chartLine = null;
     if (chartUrl) {
       chartLine = `🚨 *Chart* : ${chartUrl}`;
     }
 
-    // side emoji
     const sideEmoji =
       side === 'LONG'
         ? '🟢 LONG'
@@ -489,12 +769,10 @@ bot.command('send', async (ctx) => {
         ? '🔴 SHORT'
         : side;
 
-    // pastikan ada STATUS
     if (!data.STATUS) {
       data.STATUS = 'WAITING';
     }
 
-    // susun blok engine untuk bot (akan dibaca parser)
     const engineLines = ['#PORTX_SIGNAL'];
     if (data.PAIR) engineLines.push(`PAIR: ${data.PAIR}`);
     if (data.SIDE) engineLines.push(`SIDE: ${data.SIDE}`);
@@ -505,7 +783,6 @@ bot.command('send', async (ctx) => {
       engineLines.push(`MAX_RUNTIME_MIN: ${data.MAX_RUNTIME_MIN}`);
     }
     if (data.NOTE) engineLines.push(`NOTE: ${data.NOTE}`);
-    // info tambahan disimpan di blok teknis saja
     if (data.RISK) engineLines.push(`RISK: ${data.RISK}`);
     const volRaw = (data.VOL || data.VOLATILITY || '');
     if (volRaw) engineLines.push(`VOL: ${volRaw}`);
@@ -516,7 +793,6 @@ bot.command('send', async (ctx) => {
     engineLines.push('#END_PORTX_SIGNAL');
     const engineBlock = engineLines.join('\n');
 
-    // pesan yang dikirim ke group (Markdown, 1 bubble)
     const prettyLines = [];
     prettyLines.push('🧭 *PortX Crypto Lab — Manual Futures Signal*');
     prettyLines.push('');
@@ -542,7 +818,6 @@ bot.command('send', async (ctx) => {
     const fullMessage = prettyLines.join('\n');
 
     if (BOT_MODE === 'test') {
-      // hanya preview ke DM, tidak kirim ke channel
       await ctx.reply(
         [
           '🧪 *TEST MODE* — sinyal *TIDAK* dikirim ke channel.',
@@ -579,7 +854,6 @@ bot.on('text', async (ctx) => {
     const now = Date.now();
     const entryAvg = (parsed.entryLow + parsed.entryHigh) / 2;
 
-    // apply preset trailing kalau user tidak isi
     let trailStartPct = parsed.trailStartPct;
     let trailGapPct = parsed.trailGapPct;
     if (!trailStartPct || Number.isNaN(trailStartPct) || trailStartPct <= 0) {
@@ -587,15 +861,15 @@ bot.on('text', async (ctx) => {
       trailStartPct = preset.trailStartPct;
       trailGapPct = preset.trailGapPct;
     } else if (!trailGapPct || Number.isNaN(trailGapPct) || trailGapPct <= 0) {
-      trailGapPct = 0.02; // default gap kalau user cuma isi start
+      trailGapPct = 0.02;
     }
 
     const signal = {
       id: signalId,
       chatId,
       messageId,
-      pair: parsed.pair, // contoh: BTC_USDT
-      side: parsed.side, // LONG / SHORT
+      pair: parsed.pair,
+      side: parsed.side,
       entryLow: parsed.entryLow,
       entryHigh: parsed.entryHigh,
       entryAvg,
@@ -607,13 +881,12 @@ bot.on('text', async (ctx) => {
       createdAt: now,
       triggered: false,
       trailingActive: false,
-      highestPrice: null, // untuk LONG
-      lowestPrice: null, // untuk SHORT
+      highestPrice: null,
+      lowestPrice: null,
       closed: false,
       anchorMessageId: null,
     };
 
-    // 🧵 buat anchor thread untuk sinyal ini
     const anchor = await ctx.reply(
       [
         `🧵 Thread sinyal — ${signal.pair} ${signal.side}`,
@@ -653,7 +926,6 @@ bot.on('photo', async (ctx) => {
     const photos = ctx.message.photo;
     if (!photos || photos.length === 0) return;
 
-    // ambil resolusi paling besar
     const photo = photos[photos.length - 1];
     const fileLink = await ctx.telegram.getFileLink(photo.file_id);
     const url = fileLink.href || fileLink.toString();
@@ -662,12 +934,10 @@ bot.on('photo', async (ctx) => {
     const width = image.bitmap.width;
     const height = image.bitmap.height;
 
-    // background semi transparan di bawah
     const overlayHeight = Math.round(height * 0.08);
-    const overlay = new Jimp(width, overlayHeight, '#00000080'); // hitam transparan
+    const overlay = new Jimp(width, overlayHeight, '#00000080');
     image.composite(overlay, 0, height - overlayHeight);
 
-    // text watermark
     const font = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
     const text = 'PortX Crypto Lab — Futures Outlook';
     const textWidth = Jimp.measureText(font, text);
@@ -682,13 +952,11 @@ bot.on('photo', async (ctx) => {
       ctx.message.caption ||
       'PortX Crypto Lab — Visual Outlook (auto watermarked).';
 
-    // kirim foto baru dengan watermark
     await ctx.replyWithPhoto(
       { source: buffer },
       { caption, reply_to_message_id: ctx.message.message_id },
     );
 
-    // coba hapus foto asli (kalau bot punya izin delete)
     try {
       await ctx.deleteMessage(ctx.message.message_id);
     } catch (errDel) {
@@ -789,7 +1057,6 @@ async function checkSignals() {
 
       const replyTarget = signal.anchorMessageId || signal.messageId;
 
-      // Expire jika belum trigger dalam MAX_RUNTIME_MIN
       const ageMin = (Date.now() - signal.createdAt) / 60000;
       if (!signal.triggered && ageMin > signal.maxRuntimeMin) {
         await bot.telegram.sendMessage(
@@ -803,7 +1070,6 @@ async function checkSignals() {
         );
         recordHistory(signal, 'EXPIRED', null);
 
-        // auto delete pesan sinyal asli
         try {
           await bot.telegram.deleteMessage(signal.chatId, signal.messageId);
         } catch (errDel) {
@@ -844,7 +1110,6 @@ async function checkSignals() {
         }
 
         if (signal.triggered) {
-          // TP biasa
           if (signal.takeProfit != null && price >= signal.takeProfit) {
             signal.closed = true;
             recordHistory(signal, 'TP', price);
@@ -871,7 +1136,6 @@ async function checkSignals() {
             continue;
           }
 
-          // Trailing SL logic
           const trailResult = handleTrailing(signal, price);
           if (trailResult.updated) {
             await bot.telegram.sendMessage(
@@ -888,7 +1152,6 @@ async function checkSignals() {
             );
           }
 
-          // Stoploss
           if (price <= signal.stoploss) {
             signal.closed = true;
             recordHistory(signal, 'SL', price);
@@ -944,7 +1207,6 @@ async function checkSignals() {
         }
 
         if (signal.triggered) {
-          // TP biasa (short: harga turun)
           if (signal.takeProfit != null && price <= signal.takeProfit) {
             signal.closed = true;
             recordHistory(signal, 'TP', price);
@@ -971,7 +1233,6 @@ async function checkSignals() {
             continue;
           }
 
-          // Trailing SL logic
           const trailResult = handleTrailing(signal, price);
           if (trailResult.updated) {
             await bot.telegram.sendMessage(
@@ -988,7 +1249,6 @@ async function checkSignals() {
             );
           }
 
-          // Stoploss (short: harga naik)
           if (price >= signal.stoploss) {
             signal.closed = true;
             recordHistory(signal, 'SL', price);
@@ -1096,7 +1356,9 @@ async function sendDailyRecap() {
           ? 'TP'
           : h.outcome === 'SL'
           ? 'SL'
-          : 'Expired';
+          : h.outcome === 'EXPIRED'
+          ? 'Expired'
+          : 'Canceled';
       lines.push(
         `• ${h.pair} ${h.side} — ${outcomeText} (Entry ${h.entryLow}-${h.entryHigh}, SL ${h.stoploss}, TP ${h.takeProfit ?? '—'})`,
       );
@@ -1120,14 +1382,12 @@ async function recapScheduler() {
   const mm = nowJkt.getMinutes();
   const todayStr = nowJkt.toISOString().slice(0, 10);
 
-  // Morning header jam 07:00 WIB
   if (hh === 7 && mm === 0 && lastHeaderDate !== todayStr) {
     console.log('Running morning header for', todayStr);
     await sendMorningHeader();
     lastHeaderDate = todayStr;
   }
 
-  // Recap harian jam 23:59 WIB
   if (hh === 23 && mm === 59 && lastRecapDate !== todayStr) {
     console.log('Running daily recap for', todayStr);
     await sendDailyRecap();
@@ -1143,7 +1403,7 @@ setInterval(recapScheduler, 60000);
 // Start bot
 bot.launch().then(() => {
   console.log(
-    'PortX Crypto Lab bot running with MEXC FUTURES index price + TP + trailing SL + presets + daily recap + morning header + watermark + auto-delete + /send premium + mode live/test + thread anchor + FAQ + performance + export CSV...',
+    'PortX Crypto Lab bot running (MEXC futures index + TP/SL/trailing + presets + daily recap + morning header + watermark + auto-delete + /send premium + mode live/test + thread anchor + FAQ + performance + export CSV + cancel/close/purge)...',
   );
 });
 
